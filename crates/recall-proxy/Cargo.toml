@@ -1,0 +1,32 @@
+[package]
+name = "recall-proxy"
+description = "recall — OpenAI- and Anthropic-compatible drop-in proxy + raw sidecar that serves semantic-cache hits and forwards misses upstream. Caches non-streaming (JSON) and streaming (SSE) responses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "openai", "anthropic", "proxy"]
+categories = ["caching", "web-programming::http-server"]
+
+[dependencies]
+recall-core = { path = "../recall-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Upstream forwarding on a cache miss. rustls only — no system OpenSSL, matching the rest of recall.
+# `stream` lets a streamed miss be tee'd to the client as it arrives instead of buffered.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+blake3 = "1"
+tracing = "0.1"
+# Lock-free hot-swap of the threshold policy: `decide` reads the current snapshot on the hot path
+# while the config watcher swaps a freshly-parsed policy in (PLAN.md §3-OSS config hot-reload).
+arc-swap = "1"
+# Streaming-cache tee: consume the upstream byte stream (`futures-util`) and fan it out to the client
+# while accumulating the cache buffer (`async-stream`). Server-crate only — recall-core stays dep-free.
+futures-util = { version = "0.3", default-features = false }
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

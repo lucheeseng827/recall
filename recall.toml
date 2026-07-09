@@ -1,0 +1,59 @@
+# recall — reference configuration for `recall serve`.
+#
+# Load with:  recall serve --config recall.toml
+# Every key is optional. Precedence is: command-line flag > environment (RECALL_*) > this file >
+# built-in default. The upstream API key is read ONLY from the environment
+# (RECALL_UPSTREAM_API_KEY) so it never lands in shell history or `ps` output.
+
+# Address the proxy listens on. (flag: --listen, env: RECALL_LISTEN)
+listen = "127.0.0.1:8080"
+
+# Upstream OpenAI-compatible base URL, with NO trailing /v1. (flag: --upstream, env: RECALL_UPSTREAM)
+upstream = "https://api.openai.com"
+
+# Anthropic Messages (`/v1/messages`) upstream — separate from the OpenAI upstream above.
+# NOTE: flag/env ONLY, there is no TOML key for it (a `anthropic_upstream` line here would be
+# silently ignored). Base URL with NO trailing /v1, default https://api.anthropic.com.
+# (flag: --anthropic-upstream, env: RECALL_ANTHROPIC_UPSTREAM)
+# The `anthropic-version` header defaults to 2023-06-01 (env: RECALL_ANTHROPIC_VERSION), and the
+# Anthropic key is read ONLY from the environment (RECALL_ANTHROPIC_API_KEY), like the OpenAI key.
+
+# Outermost cache namespace component; layer tenancy on top of this. (flag: --base-namespace)
+base_namespace = "default"
+
+# ANN index: "brute" (exact, default — the recall oracle) or "hnsw" (approximate, sublinear at
+# scale; validate recall@1 for your dims/N with `recall ann-bench` first — see BENCHMARKS.md).
+# Both are pure-Rust, no extra deps. (flag: --index, env: RECALL_INDEX)
+# index = "brute"
+
+# Store backend: "memory" (default, ephemeral) or "redb" (durable, restart-surviving). "redb" needs
+# a `--features store-redb` build; on a build without it (or a redb open failure) `serve` exits
+# non-zero rather than silently downgrading. (flag: --store, env: RECALL_STORE)
+# store = "memory"
+# Path redb persists to when store = "redb". (flag: --db-path, env: RECALL_DB_PATH)
+# db_path = "/var/lib/recall/cache.redb"
+
+# Requests with temperature strictly above this BYPASS the cache (lookup and store): replaying a
+# highly-sampled completion is a silent behavior change. OpenAI's default temperature is 1.0.
+# (flag: --max-temperature, env: RECALL_MAX_TEMPERATURE)
+max_temperature = 1.0
+
+# Similarity cutoff. With policy = "static" this is the fixed threshold; with policy = "adaptive" it
+# is the cold-start prior τ₀ the engine starts from. (flag: --tau, env: RECALL_TAU)
+tau = 0.9
+
+# Threshold policy: "static" (fixed τ, default) or "adaptive" (learns a per-namespace τ toward a
+# target false-hit rate; rests at τ₀ until feedback arrives). (flag: --policy, env: RECALL_POLICY)
+# policy = "static"
+# With `recall serve --watch-config`, edits to the threshold settings below (policy / tau / target_fhr)
+# are hot-reloaded in place — no restart, no dropped connections. A field pinned by a flag or env var
+# keeps its startup value; a parse error keeps the previous good policy. Other settings (listen,
+# upstream, model, index, store, …) are NOT hot-reloadable and need a restart.
+# Target false-hit rate the adaptive policy aims to hold (e.g. 0.02 = ≤2% wrong cache hits).
+# (flag: --target-fhr, env: RECALL_TARGET_FHR)
+# target_fhr = 0.02
+
+# Optional path to a local model2vec/potion model directory (config.json + tokenizer.json +
+# model.safetensors). Requires a `--features static` build; otherwise the hash embedder is used.
+# (flag: --model, env: RECALL_MODEL2VEC_PATH)
+# model = "/var/lib/recall/potion-base-8M"

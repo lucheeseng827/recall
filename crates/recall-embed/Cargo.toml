@@ -1,0 +1,30 @@
+[package]
+name = "recall-embed"
+description = "recall — real embedder backends behind feature flags. `static` = model2vec-rs/potion (sub-ms, local-load); the default build adds nothing over recall-core's deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "embeddings", "semantic-cache", "model2vec", "nlp"]
+categories = ["caching", "text-processing"]
+exclude = ["*.onnx", "*.safetensors"]
+
+[features]
+# Default adds NOTHING heavy: with no feature on, this crate is just a thin re-export of core's
+# HashEmbedder, so depending on recall-embed never silently pulls ML deps (PLAN.md §3-OSS).
+default = []
+# The production default embedder: static token-vector lookup, sub-ms, no transformer forward pass.
+# `model2vec-rs` is added with default-features = false and LOCAL load only — no hf-hub/ureq, so the
+# `static` build still has no runtime network (PLAN.md §1 embeddings, §7).
+static = ["dep:model2vec-rs"]
+
+[dependencies]
+recall-core = { path = "../recall-core" }
+# `fancy-regex` is a PURE-RUST regex backend for the bundled `tokenizers` — chosen over the default
+# `onig` (a C library) to preserve the no-C-deps, single-static-binary property. `local-only`
+# AUTHORITATIVELY disables remote model downloads at the source level (its cfg returns an explicit
+# "downloads disabled" error), so even if Cargo feature-unification ever turned on `hf-hub`
+# elsewhere, the `static` build still cannot reach the network — a non-existent model path errors
+# instead of downloading (PLAN.md §1 embeddings, §7).
+model2vec-rs = { version = "0.2", optional = true, default-features = false, features = ["fancy-regex", "local-only"] }

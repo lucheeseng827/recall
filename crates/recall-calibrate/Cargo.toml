@@ -1,0 +1,15 @@
+[package]
+name = "recall-calibrate"
+description = "recall's adaptive threshold engine: a feedback-driven ThresholdPolicy that targets an operator false-hit rate instead of a static cosine cutoff. Pure math + counters, no deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "semantic-cache", "threshold", "calibration"]
+categories = ["caching", "algorithms"]
+
+# Pure Rust: only depends on the seam crate. No network, no ML, no C deps — it stays inside the
+# single-static-binary / air-gap envelope and is safe to compile into the default binary.
+[dependencies]
+recall-core = { path = "../recall-core" }

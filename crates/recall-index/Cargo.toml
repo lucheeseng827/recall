@@ -1,0 +1,26 @@
+[package]
+name = "recall-index"
+description = "recall's HNSW ANN index (PLAN.md §3-OSS, T3): a pure-Rust, zero-dependency hierarchical navigable small-world graph behind recall-core's AnnIndex seam, benchmarked recall@1 >= 0.98 against the brute-force oracle. No external ANN crate, no C deps — stays inside the air-gap envelope."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "semantic-cache", "ann", "hnsw"]
+categories = ["caching", "algorithms", "data-structures"]
+exclude = ["benches/"]
+
+# Pure Rust: only the seam crate. No external ANN dependency (e.g. hnsw_rs pulls a ~100-crate tree),
+# no C deps — the HNSW backend stays inside the single-static-binary / air-gap envelope, the same way
+# recall-calibrate keeps the adaptive engine dependency-free.
+[dependencies]
+recall-core = { path = "../recall-core" }
+
+[dev-dependencies]
+# Criterion for the flat-vs-HNSW search bench (PLAN.md §6.4). Dev-only — the crate stays
+# zero-dependency for consumers; default-features off drops plotters/rayon.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "ann"
+harness = false

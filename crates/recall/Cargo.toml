@@ -1,0 +1,46 @@
+[package]
+name = "recall"
+description = "recall — the `recalld`-class CLI for the self-hosted semantic cache: `serve` runs the OpenAI-compatible proxy; `ask`/`bench` drive and measure the loop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "semantic-cache", "proxy", "cli"]
+categories = ["caching", "command-line-utilities"]
+
+# The binary is named `recall` (PLAN.md calls the eventual daemon `recalld`; the CLI keeps `recall`).
+[[bin]]
+name = "recall"
+path = "src/main.rs"
+
+[features]
+default = []
+# Build the static (model2vec/potion) embedder into `recall serve --model <dir>`.
+static = ["recall-embed/static"]
+# Build the durable redb store into `recall serve --store redb --db-path <file>`.
+store-redb = ["dep:recall-store", "recall-store/redb"]
+
+[dependencies]
+recall-core = { path = "../recall-core" }
+recall-embed = { path = "../recall-embed" }
+recall-proxy = { path = "../recall-proxy" }
+recall-store = { path = "../recall-store", optional = true }
+# Adaptive threshold engine (pure-Rust, light) — always available; selected at runtime via --policy.
+recall-calibrate = { path = "../recall-calibrate" }
+# HNSW ANN index (pure-Rust, zero-dep) — always available; selected at runtime via --index.
+recall-index = { path = "../recall-index" }
+# Runtime for `recall serve`. `ask`/`bench` stay synchronous; only `serve` needs async.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# Reference-config (recall.toml) loading for `serve`. Flags/env override the file.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# `calibrate` parses a labeled JSONL pair set. serde_json is already in the tree (recall-proxy).
+serde_json = "1"
+# Structured logging for `serve`: the proxy emits hit/miss/bypass/error events via `tracing`; the
+# binary installs the subscriber. `env-filter` makes the level configurable via RUST_LOG.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+# `--watch-config` hot-reload: watch the config file's directory and swap the threshold policy
+# in-process (PLAN.md §3-OSS). Only used by `serve`; the swap primitive lives in recall-proxy.
+notify = "6"

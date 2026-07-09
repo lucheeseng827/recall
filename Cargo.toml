@@ -1,0 +1,36 @@
+# recall — self-hosted, Rust-native semantic cache.
+#
+# STANDALONE workspace (own Cargo.lock, own target/). It is added to the repo-root
+# Cargo.toml `exclude` list by explicit path — the root member glob would otherwise
+# try to absorb this nested workspace (the standard treatment for a nested workspace).
+#
+# This workspace must build standalone, with nothing outside it present — the
+# member list below is the complete, closed set of crates it ships.
+[workspace]
+resolver = "2"
+members = [
+    "crates/recall-core",
+    "crates/recall-embed",
+    "crates/recall-store",
+    "crates/recall-calibrate",
+    "crates/recall-index",
+    "crates/recall-proxy",
+    "crates/recall",
+    "crates/recall-eval",
+]
+
+# Shared package metadata so every crate inherits one version/edition/license/repository.
+# `repository` points at the monorepo until the public `.ossync` mirror is created — the
+# per-product repo URL is set when the first mirror/publish lands.
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/nick-rust-project"
+authors = ["recall contributors"]
+
+# Aggressive size/speed profile, consistent with the single-static-binary pitch.
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

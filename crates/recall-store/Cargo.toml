@@ -1,0 +1,23 @@
+[package]
+name = "recall-store"
+description = "recall durable Store backends. The Store seam + in-memory MemKv live in recall-core; this crate adds restart-surviving implementations (redb: pure-Rust ACID) behind feature flags."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "semantic-cache", "redb", "storage"]
+categories = ["caching", "database"]
+
+[features]
+# default is empty: a deps-free crate until a durable backend is asked for, so it never perturbs
+# the single-static-binary / air-gap default build (PLAN.md §3-OSS).
+default = []
+# Durable, restart-surviving Store backed by `redb` (pure-Rust ACID, copy-on-write B-tree, no C
+# dep). Pulls redb + serde_json (to blob the Entry) + recall-core's serde derives.
+redb = ["dep:redb", "dep:serde_json", "recall-core/serde"]
+
+[dependencies]
+recall-core = { path = "../recall-core" }
+redb = { version = "2", optional = true }
+serde_json = { version = "1", optional = true }

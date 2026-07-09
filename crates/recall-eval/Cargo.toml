@@ -1,0 +1,24 @@
+[package]
+name = "recall-eval"
+description = "recall — reproducible eval harness for the adaptive threshold: hit-rate vs false-hit-rate across policies (static@0.8, static@best, adaptive) on controllable-density synthetic traffic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["llm", "cache", "semantic-cache", "evaluation", "benchmark"]
+categories = ["caching", "development-tools"]
+# A validation/reproducibility harness, not a library other crates depend on. It ships in the source
+# tree (the adaptive engine is open and reproducible from source) but is not a crates.io package.
+publish = false
+
+[[bin]]
+name = "recall-eval"
+path = "src/main.rs"
+
+[dependencies]
+# Drives the REAL policies through the `ThresholdPolicy` seam — this is an eval of the shipped
+# policy code, not a reimplementation. No external deps: the synthetic stream uses a hand-rolled
+# deterministic PRNG so results are byte-reproducible.
+recall-core = { path = "../recall-core" }
+recall-calibrate = { path = "../recall-calibrate" }
