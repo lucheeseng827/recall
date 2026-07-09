@@ -1,0 +1,32 @@
+# CI for the PUBLIC recall repo. This file lives ONLY here — the monorepo sync
+# deliberately never touches .github (its token has no Workflows permission), so
+# edit it directly on this repo.
+#
+# Runs the same portable quality gate contributors run locally (scripts/ci.sh:
+# fmt, clippy default+all-features -D warnings, bench compile, and the test
+# matrix incl. the static-embedder and redb feature legs), plus a --locked
+# build so a fresh clone of this repo is proven to build against the committed
+# Cargo.lock.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (locked)
+        run: cargo build --workspace --locked
+      - name: Full gate (fmt + clippy + test matrix)
+        run: ./scripts/ci.sh
