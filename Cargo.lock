@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "recall"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "notify",
  "recall-calibrate",
@@ -1617,14 +1617,14 @@ dependencies = [
 
 [[package]]
 name = "recall-calibrate"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "recall-core",
 ]
 
 [[package]]
 name = "recall-core"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "criterion",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "recall-embed"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "model2vec-rs",
  "recall-core",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "recall-eval"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "recall-calibrate",
  "recall-core",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "recall-index"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "recall-core",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "recall-proxy"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "recall-store"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "recall-core",
  "redb",

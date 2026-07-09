@@ -248,6 +248,10 @@ the same affinity so the adaptive threshold trains on the instance that served t
 
 ## Quick start
 
+> New here? **[docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md)** is the 10-minute
+> tour: bench → hand-driven loop → caching proxy with a mock upstream (miss at 1.2 s,
+> hit at 2 ms, hits surviving a restart), all from captured real runs.
+
 ```bash
 # from this module directory
 cargo run -p recall -- bench               # synthetic FAQ workload: hit-rate + p50/p99 latency

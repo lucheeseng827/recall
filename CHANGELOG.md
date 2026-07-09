@@ -6,7 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-10
+
+First tagged release after the public mirror went live.
+
 ### Added
+- **Getting-started tutorial** (`docs/GETTING_STARTED.md`): bench → hand-driven
+  loop → caching proxy against a mock upstream (miss at ~1.2 s, hit at ~2 ms,
+  hits surviving a restart), with every output block captured from real runs.
+- Reference docs shipped alongside the code: `docs/CONFIG.md`, `docs/API.md`,
+  `docs/OPERATIONS.md`.
 - Release scaffolding for the first public cut: `CONTRIBUTING.md` (DCO sign-off),
   `SECURITY.md` (disclosure policy + the structural-not-authenticated security
   model note), this `CHANGELOG.md`, and crates.io `keywords`/`categories` on the
@@ -49,7 +58,7 @@ All notable changes to this project are documented here. The format is based on
   (listen / upstream / model / index / store) are logged with a restart hint and ignored.
 
 ### Changed
-- Workspace version set to `0.1.0-alpha.1` for the first alpha.
+- Workspace version `0.1.0-alpha.1` → `0.1.1`.
 
 ### Fixed
 - **Streaming cache no longer stores truncated completions.** A streamed miss is now cached only when
@@ -89,5 +98,6 @@ embeddable library.
   `/metrics`.
 - **CLI** (`recall`): `serve`, `ask`, `bench`, `ann-bench`, `replay`.
 
-[Unreleased]: https://github.com/lucheeseng827/recall/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/recall/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/lucheeseng827/recall/compare/v0.1.0-alpha.1...v0.1.1
 [0.1.0-alpha.1]: https://github.com/lucheeseng827/recall/releases/tag/v0.1.0-alpha.1
