@@ -25,6 +25,28 @@ base_namespace = "default"
 # scale; validate recall@1 for your dims/N with `recall ann-bench` first — see BENCHMARKS.md).
 # Both are pure-Rust, no extra deps. (flag: --index, env: RECALL_INDEX)
 # index = "brute"
+# HNSW graph tunables (only with index = "hnsw"). Defaults (m=32, ef_construction=400,
+# ef_search=256) are validated at the bundled 256-dim embedder width; ef_search is the
+# recall-vs-latency dial to raise first if `recall ann-bench` shows recall@1 short of the gate for
+# your dims/N. (flags: --hnsw-m, --hnsw-ef-construction, --hnsw-ef-search; env: RECALL_HNSW_*)
+# hnsw_m = 32
+# hnsw_ef_construction = 400
+# hnsw_ef_search = 256
+
+# Second-neighbour ambiguity gate: a would-be hit whose top-2 neighbours sit within this similarity
+# of each other AND store different answers is served as a MISS — near-tied lookalikes with
+# disagreeing completions are where false hits live; near-duplicates with the same answer replay
+# regardless. 0 (default) disarms the gate. Demotions are counted by recall_ambiguity_miss_total.
+# (flag: --ambiguity-eps, env: RECALL_AMBIGUITY_EPS)
+# ambiguity_eps = 0.02
+
+# Persist the savings counters into the durable store every N seconds, so the "$ saved" figure
+# survives a restart instead of resetting on every deploy. Only with store = "redb". A clean
+# shutdown flushes on the way out, so a planned deploy loses nothing; an unclean exit loses at most
+# N seconds. 0 (the default) keeps the documented behaviour: the counters reset with the process. When on, the node reports recall_ledger_since_time_seconds so a consumer
+# can tell the counters predate this process.
+# (flag: --savings-flush-secs, env: RECALL_SAVINGS_FLUSH_SECS)
+# savings_flush_secs = 30
 
 # Store backend: "memory" (default, ephemeral) or "redb" (durable, restart-surviving). "redb" needs
 # a `--features store-redb` build; on a build without it (or a redb open failure) `serve` exits
@@ -57,3 +79,26 @@ tau = 0.9
 # model.safetensors). Requires a `--features static` build; otherwise the hash embedder is used.
 # (flag: --model, env: RECALL_MODEL2VEC_PATH)
 # model = "/var/lib/recall/potion-base-8M"
+
+# --- Price book (optional) -------------------------------------------------------------------
+# Your own USD-per-million-token rates, used to report `recall_cost_saved_usd_total` on /metrics
+# alongside the raw `recall_tokens_saved_total`. There is no bundled price list and no network
+# lookup: vendor prices change and differ by contract, so the only numbers recall will price with
+# are the ones you put here. File-only (no flag or env form) and NOT hot-reloadable — a rate change
+# needs a restart.
+#
+# Input and output are priced separately because providers charge output at roughly 3-5x input.
+# A model with no matching rule is never guessed at: its saved tokens are reported in
+# `recall_unpriced_tokens_saved_total` and contribute $0, so an incomplete table reads as
+# "unpriced" rather than as "the cache saved nothing".
+#
+# A key ending in `*` is a prefix rule (handy for dated snapshots); a bare key matches exactly.
+# When several rules match, the longest stem wins.
+#
+# [pricing."gpt-4o"]
+# input = 2.50      # USD per 1M input (prompt) tokens
+# output = 10.00    # USD per 1M output (completion) tokens
+#
+# [pricing."gpt-4o-mini*"]   # also covers gpt-4o-mini-2024-07-18
+# input = 0.15
+# output = 0.60

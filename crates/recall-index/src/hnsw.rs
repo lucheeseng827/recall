@@ -17,8 +17,8 @@ fn dist(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot(a, b)
 }
 
-/// Tunables for the graph. Defaults follow the HNSW paper's common settings (M=16) with a search
-/// breadth chosen so `recall@1 >= 0.98` holds at the cache's small-N regime.
+/// Tunables for the graph. Defaults are validated at the bundled embedder's 256-dim width (see
+/// `Default` below and BENCHMARKS.md); `ef_search` is the recall-vs-latency dial to move first.
 #[derive(Clone, Copy, Debug)]
 pub struct HnswConfig {
     /// Max neighbors per node on layers above 0.
@@ -38,12 +38,26 @@ pub struct HnswConfig {
 
 impl Default for HnswConfig {
     fn default() -> Self {
-        let m = 16;
+        // Validated at the bundled embedder's 256-dim width on uniform-random vectors (the hardest
+        // case — real embeddings cluster): recall@1 = 0.998 at 10k with this config (vs 0.958 at
+        // ef_search=128), decaying to 0.876 at 50k — see BENCHMARKS.md. `ann-bench
+        // --m/--ef-search` re-measures for your dims/N: raise ef_search toward 512–1024 at 50k+,
+        // lower it to shave search latency on small corpora.
+        Self::with_params(32, 400, 256)
+    }
+}
+
+impl HnswConfig {
+    /// Build a config from the three knobs that matter, deriving the conventional `m0 = 2·m` and
+    /// `mL = 1/ln(m)` (and the default seed). Degenerate values are clamped to the minimum sane
+    /// graph (`m ≥ 2`, breadths ≥ 1) instead of producing an unroutable graph.
+    pub fn with_params(m: usize, ef_construction: usize, ef_search: usize) -> Self {
+        let m = m.max(2);
         Self {
             m,
             m0: m * 2,
-            ef_construction: 200,
-            ef_search: 64,
+            ef_construction: ef_construction.max(1),
+            ef_search: ef_search.max(1),
             ml: 1.0 / (m as f64).ln(),
             seed: 0x243F_6A88_85A3_08D3,
         }
@@ -183,7 +197,41 @@ impl Graph {
         out
     }
 
-    /// Re-select `id`'s neighbor list at `layer` to the `cap` closest (the simple HNSW heuristic).
+    /// The HNSW paper's SELECT-NEIGHBORS-HEURISTIC (Alg. 4): walk `candidates` nearest-first and
+    /// keep one only if it is closer to the base point than to every neighbor already kept, then
+    /// backfill remaining slots with the nearest discarded ones (`keepPrunedConnections`). Naive
+    /// take-the-`cap`-closest selection wires near-duplicate edges pointing the same way; at high
+    /// dimensionality that starves the graph of long-range links and collapses recall@1 (measured
+    /// ~0.26 at 50k × 256-dim before this heuristic — see BENCHMARKS.md). `candidates` must be
+    /// sorted nearest-first (`Cand.dist` = distance to the base point).
+    fn select_diverse(&self, candidates: &[Cand], cap: usize) -> Vec<usize> {
+        let mut selected: Vec<Cand> = Vec::with_capacity(cap);
+        let mut discarded: Vec<Cand> = Vec::new();
+        for &c in candidates {
+            if selected.len() >= cap {
+                break;
+            }
+            let diverse = selected
+                .iter()
+                .all(|s| dist(&self.nodes[c.id].vec, &self.nodes[s.id].vec) > c.dist);
+            if diverse {
+                selected.push(c);
+            } else {
+                discarded.push(c);
+            }
+        }
+        // keepPrunedConnections: top the list back up with the closest discarded candidates so a
+        // node keeps its full degree (connectivity matters as much as diversity for recall).
+        for c in discarded {
+            if selected.len() >= cap {
+                break;
+            }
+            selected.push(c);
+        }
+        selected.into_iter().map(|c| c.id).collect()
+    }
+
+    /// Re-select `id`'s neighbor list at `layer` down to `cap` via the diversity heuristic.
     /// Clones `id`'s vector to sidestep the simultaneous borrow of `nodes`.
     fn prune(&mut self, id: usize, layer: usize, cap: usize) {
         if self.nodes[id].links[layer].len() <= cap {
@@ -198,8 +246,7 @@ impl Graph {
             })
             .collect();
         cands.sort_unstable();
-        cands.truncate(cap);
-        self.nodes[id].links[layer] = cands.into_iter().map(|c| c.id).collect();
+        self.nodes[id].links[layer] = self.select_diverse(&cands, cap);
     }
 
     fn insert(&mut self, key: Key, vec: Vec<f32>, cfg: &HnswConfig) {
@@ -242,12 +289,14 @@ impl Graph {
             }
         }
 
-        // Phase 2: from min(top, level) down to 0, connect bidirectionally.
+        // Phase 2: from min(top, level) down to 0, connect bidirectionally. Neighbors are chosen
+        // with the diversity heuristic, not take-the-closest — the difference between a graph that
+        // routes at 256-dim and one that doesn't (see `select_diverse`).
         let start = self.top_layer.min(level);
         for lc in (0..=start).rev() {
             let w = self.search_layer(&query, &ep_ids, cfg.ef_construction, lc);
             let cap = if lc == 0 { cfg.m0 } else { cfg.m };
-            let selected: Vec<usize> = w.iter().take(cap).map(|c| c.id).collect();
+            let selected: Vec<usize> = self.select_diverse(&w, cap);
             self.nodes[id].links[lc] = selected.clone();
             for &nb in &selected {
                 self.nodes[nb].links[lc].push(id);

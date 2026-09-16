@@ -26,10 +26,15 @@
 //! server logs (see SECURITY.md).
 
 pub mod config;
+pub mod export;
+pub mod ledger;
 pub mod metrics;
+pub mod namespaces;
+pub mod pricing;
 pub mod reload;
 pub mod replay;
 pub mod request;
+pub mod scrape;
 
 use std::sync::Arc;
 
@@ -62,6 +67,17 @@ pub struct ProxyState {
     pub http: reqwest::Client,
     pub config: Config,
     pub metrics: Metrics,
+    /// Unix seconds at which this process started. Reported as `recall_process_start_time_seconds`
+    /// so a scraper can tell a counter reset (a restart) from a quiet period.
+    pub started_at_unix: u64,
+    /// The savings counters split by cache namespace — "worth it for whom", which the node-level
+    /// totals cannot answer. Bounded and served as JSON at `GET /v1/cache/namespaces` rather than
+    /// as metric labels, because the namespace is caller-derived (see [`namespaces`]).
+    pub namespaces: namespaces::NamespaceLedger,
+    /// Unix seconds the persisted savings ledger began, or `0` when counter persistence is off
+    /// (the default) and the counters therefore reset with this process. Set by the binary after a
+    /// successful restore; reported as `recall_ledger_since_time_seconds`.
+    pub ledger_since_unix: std::sync::atomic::AtomicU64,
 }
 
 impl ProxyState {
@@ -74,11 +90,18 @@ impl ProxyState {
             .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let started_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Arc::new(Self {
+            started_at_unix,
             cache,
             http,
             config,
             metrics: Metrics::default(),
+            namespaces: namespaces::NamespaceLedger::new(),
+            ledger_since_unix: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -153,6 +176,7 @@ pub fn app(state: Arc<ProxyState>) -> Router {
         .route("/v1/cache/lookup", post(cache_lookup))
         .route("/v1/cache/insert", post(cache_insert))
         .route("/v1/cache/feedback", post(cache_feedback))
+        .route("/v1/cache/namespaces", get(cache_namespaces))
         .route("/healthz", get(healthz))
         .route("/metrics", get(render_metrics))
         .with_state(state)
@@ -178,6 +202,7 @@ async fn chat_completions(
         namespace: Namespace::new(parsed.namespace_string(&state.config.base_namespace)).ok(),
         prompt: parsed.canonical_prompt(),
         stream: parsed.is_stream(),
+        model: parsed.model().to_string(),
     };
     let upstream = Upstream {
         base: &state.config.upstream_base,
@@ -216,6 +241,7 @@ async fn messages(
         namespace: Namespace::new(parsed.namespace_string(&state.config.base_namespace)).ok(),
         prompt: parsed.canonical_prompt(),
         stream: parsed.is_stream(),
+        model: parsed.model().to_string(),
     };
     let upstream = Upstream {
         base: &state.config.anthropic_upstream_base,
@@ -239,6 +265,9 @@ struct Mapped {
     namespace: Option<Namespace>,
     prompt: String,
     stream: bool,
+    /// The requested model id, as the caller wrote it — the price-book key on a hit. Kept out of the
+    /// namespace's business: the namespace is a *fingerprint* of the model, this is the name.
+    model: String,
 }
 
 /// THE shared cache flow, identical across API flavors: bypass → forward verbatim; otherwise
@@ -279,12 +308,42 @@ async fn serve_cached(
             Metrics::inc(&state.metrics.hits);
             // Namespace + score only — never the prompt or completion (see the module redaction note).
             tracing::debug!(namespace = ns.as_str(), score, stream, "cache hit");
-            // `usage_of` understands both a JSON body and a stored SSE stream (via sse_data_payloads),
-            // so a streamed hit counts its saved tokens too.
+            // `usage_of` reads both shapes a stored completion can take — one JSON object, and the
+            // raw SSE of a stored streamed response (see `request::openai_usage`) — so a streamed
+            // hit credits its saved tokens and dollars like any other.
             let usage = (upstream.usage_of)(&entry.completion);
             Metrics::add(&state.metrics.tokens_saved, usage.total());
             Metrics::add(&state.metrics.input_tokens_saved, usage.input);
             Metrics::add(&state.metrics.output_tokens_saved, usage.output);
+            // Price the saved tokens with the operator's own rates. A model with no rule is counted
+            // as unpriced rather than as $0 saved, so an incomplete price book is visible in
+            // `/metrics` instead of silently deflating the savings figure (see `pricing`).
+            state.metrics.record_savings(
+                &state.config.pricing,
+                &mapped.model,
+                usage.input,
+                usage.output,
+            );
+            // The same credit, split by namespace, for `GET /v1/cache/namespaces` — "worth it for
+            // whom", which the node-level counters cannot answer. Re-pricing here rather than
+            // threading the figure out of `record_savings` keeps that API untouched; the price book
+            // is a handful of rules, so the second lookup is noise next to serialising the reply.
+            let priced = state
+                .config
+                .pricing
+                .cost_micros(&mapped.model, usage.input, usage.output);
+            state.namespaces.record_hit(
+                ns.as_str(),
+                usage.input,
+                usage.output,
+                priced.unwrap_or(0),
+                priced.is_some(),
+            );
+            // A completion that reported no usage credits nothing anywhere. Count it, so the
+            // savings figure reads as under-counted rather than as an idle cache.
+            if usage.total() == 0 {
+                Metrics::inc(&state.metrics.hits_usage_unknown);
+            }
             // The body was stored under a stream-specific namespace, so a streaming hit always holds
             // SSE (replayed chunk-by-chunk) and a non-streaming hit always holds JSON.
             let mut resp = if stream {
@@ -317,11 +376,25 @@ async fn serve_cached(
             resp
         }
         Ok(Lookup::Miss { vector }) => {
+            // Counted here, once, for every cacheable request the cache could not answer — which is
+            // exactly what `recall_misses_total` claims to be, and what makes `hits / (hits +
+            // misses)` a hit rate over cacheable traffic. Deliberately NOT conditioned on what the
+            // upstream then does: the two paths used to disagree about this (the buffered one
+            // counted only responses it could cache, the streamed one counted every forward), so
+            // the same failing upstream moved the hit rate on one path and not the other.
+            Metrics::inc(&state.metrics.misses);
             // A streamed miss is tee'd to the client as it arrives (and cached on a clean end); only
             // the non-streamed JSON path buffers the full upstream body before returning it.
             if stream {
                 return forward_stream_and_cache(
-                    state, headers, body, upstream, ns, prompt, vector,
+                    state,
+                    headers,
+                    body,
+                    upstream,
+                    ns,
+                    prompt,
+                    vector,
+                    mapped.model,
                 )
                 .await;
             }
@@ -340,12 +413,25 @@ async fn serve_cached(
                         && ct.starts_with("application/json")
                         && serde_json::from_str::<serde_json::Value>(&text).is_ok();
                     if cacheable {
-                        Metrics::inc(&state.metrics.misses);
                         // Log "stored" only after the write actually succeeds; a failed put must not
                         // claim the entry is cached (the next identical request would miss again).
                         let ns_label = ns.as_str().to_string();
                         match cache_put(state, ns, prompt, text.clone(), vector).await {
-                            Ok(()) => tracing::debug!(namespace = %ns_label, "cache miss (stored)"),
+                            Ok(()) => {
+                                // The write succeeded, so this entry was bought and kept: credit
+                                // what it cost. Counted here rather than on the miss itself — a
+                                // miss that was not stored bought nothing for the cache, and
+                                // charging it would inflate the fill cost with money that would
+                                // have been spent with recall switched off entirely.
+                                let usage = (upstream.usage_of)(&text);
+                                state.metrics.record_fill(
+                                    &state.config.pricing,
+                                    &mapped.model,
+                                    usage.input,
+                                    usage.output,
+                                );
+                                tracing::debug!(namespace = %ns_label, "cache miss (stored)")
+                            }
                             Err(e) => tracing::warn!(
                                 namespace = %ns_label,
                                 error = %e,
@@ -500,10 +586,50 @@ async fn cache_feedback(
             "score must be a cosine similarity in [-1, 1]",
         );
     }
+    // Count the judgement at the proxy before handing it to the policy. The default
+    // `StaticThreshold` discards observations, so without this a wrong-hit report would vanish
+    // behind a `200 {"accepted": true}` with nothing recording that the cache served a wrong
+    // answer — and the observed false-hit rate would be unmeasurable on the default config.
+    Metrics::inc(match outcome {
+        Outcome::Agree => &state.metrics.feedback_agree,
+        Outcome::Wrong => &state.metrics.feedback_wrong,
+    });
     state.cache.observe(&ns, req.score, outcome);
     json_ok(&FeedbackResp {
         accepted: true,
         policy: state.cache.policy_id().to_string(),
+    })
+}
+
+/// `GET /v1/cache/namespaces` — the savings counters split by cache namespace.
+///
+/// The node-level figures in `/metrics` say whether the cache is worth running; these rows say
+/// *for whom*, which is the question the moment more than one team or model shares a proxy. This
+/// is a JSON document rather than a metric family on purpose: the namespace is derived from the
+/// request, so per-namespace series would be caller-controlled Prometheus cardinality.
+///
+/// The rows are a **split of the same hits** the node counters already counted, never an addition
+/// to them, and they are bounded — past [`namespaces::NamespaceLedger::MAX`] distinct namespaces
+/// the rest fold into one `(other namespaces)` row, so `truncated` says when the tail was folded.
+async fn cache_namespaces(State(state): State<Arc<ProxyState>>) -> Response {
+    #[derive(Serialize)]
+    struct NamespacesResp {
+        /// Versioned like the export document, so a consumer can dispatch before parsing.
+        schema: &'static str,
+        /// Unix seconds this process started — the boundary these counters reset at, matching
+        /// `recall_process_start_time_seconds`.
+        process_start_unix: u64,
+        /// True once the cap was reached and further namespaces folded into the overflow row.
+        truncated: bool,
+        /// Biggest saver first.
+        namespaces: Vec<namespaces::NamespaceRow>,
+    }
+    let rows = state.namespaces.rows();
+    json_ok(&NamespacesResp {
+        schema: "recall.namespaces/v1",
+        process_start_unix: state.started_at_unix,
+        truncated: rows.iter().any(|r| r.namespace == namespaces::OVERFLOW),
+        namespaces: rows,
     })
 }
 
@@ -512,12 +638,20 @@ async fn healthz() -> &'static str {
 }
 
 async fn render_metrics(State(state): State<Arc<ProxyState>>) -> Response {
-    text_response(
-        StatusCode::OK,
-        "text/plain; version=0.0.4",
-        None,
-        state.metrics.render(),
-    )
+    // The entry count is read from the store at scrape time rather than mirrored into a counter:
+    // both backends answer it cheaply (a HashMap len, or a redb B-tree metadata read — neither
+    // scans), and a process-local counter would read 0 after a restart that rehydrated a full
+    // durable store, since rehydration re-indexes without going back through `put`.
+    let body = state.metrics.render_with(&metrics::RuntimeFacts {
+        entries: state.cache.entries(),
+        store: &state.config.store,
+        started_at_unix: state.started_at_unix,
+        ambiguity_misses: state.cache.ambiguity_misses(),
+        ledger_since_unix: state
+            .ledger_since_unix
+            .load(std::sync::atomic::Ordering::Relaxed),
+    });
+    text_response(StatusCode::OK, "text/plain; version=0.0.4", None, body)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -683,6 +817,7 @@ async fn forward_collect(
 /// error, or a truncated/cut-off stream is streamed through to the client but never cached (so a
 /// partial completion can't be replayed as if whole). The cache write completes before the stream
 /// ends, so a concurrent identical request resolves the freshly stored entry.
+#[allow(clippy::too_many_arguments)]
 async fn forward_stream_and_cache(
     state: &Arc<ProxyState>,
     headers: &HeaderMap,
@@ -691,6 +826,9 @@ async fn forward_stream_and_cache(
     ns: Namespace,
     prompt: String,
     vector: Vec<f32>,
+    // The requested model, for pricing the fill. By value because the 'static stream below cannot
+    // borrow from `upstream` or the request.
+    model: String,
 ) -> Response {
     use futures_util::StreamExt;
 
@@ -716,12 +854,12 @@ async fn forward_stream_and_cache(
         .unwrap_or("application/json")
         .to_string();
     let cacheable = status.is_success() && ct.starts_with("text/event-stream");
-    Metrics::inc(&state.metrics.misses);
 
     let state = state.clone();
-    // Copy the flavor-specific completion check out of the borrowed `upstream` so the 'static stream
-    // owns it (a `fn` pointer is `Copy`).
+    // Copy the flavor-specific completion check and usage extractor out of the borrowed `upstream`
+    // so the 'static stream owns them (a `fn` pointer is `Copy`).
     let stream_complete = upstream.stream_complete;
+    let usage_of = upstream.usage_of;
     let stream = async_stream::stream! {
         let mut acc: Vec<u8> = Vec::new();
         let mut upstream_body = resp.bytes_stream();
@@ -750,8 +888,20 @@ async fn forward_stream_and_cache(
                 Ok(text) if stream_complete(&text) => {
                     // Log "stored" only after the write succeeds — a failed put isn't a stored entry.
                     let ns_label = ns.as_str().to_string();
+                    // `cache_put` moves `text`, so read the usage out of the assembled SSE first.
+                    let usage = usage_of(&text);
                     match cache_put(&state, ns, prompt, text, vector).await {
-                        Ok(()) => tracing::debug!(namespace = %ns_label, "streamed miss (stored)"),
+                        Ok(()) => {
+                            // Same rule as the JSON path: credit the fill only once the write
+                            // actually succeeded.
+                            state.metrics.record_fill(
+                                &state.config.pricing,
+                                &model,
+                                usage.input,
+                                usage.output,
+                            );
+                            tracing::debug!(namespace = %ns_label, "streamed miss (stored)")
+                        }
                         Err(e) => tracing::warn!(
                             namespace = %ns_label,
                             error = %e,

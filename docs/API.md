@@ -116,6 +116,39 @@ The `policy` field shows whether feedback actually trains: a `static@…` policy
 accepts feedback but ignores it; only `adaptive@…` learns. Errors: `400` invalid
 namespace / outcome / out-of-range score.
 
+### `GET /v1/cache/namespaces` — savings, split by namespace
+
+The node counters say whether the cache is worth running; these rows say *for
+whom* — the question the moment more than one team or model shares a proxy.
+Rows are a **split of the same hits** the node counters already counted, never
+an addition, so they sum to at most the node totals.
+
+```text
+$ curl -s http://127.0.0.1:8080/v1/cache/namespaces
+{
+  "schema": "recall.namespaces/v1",
+  "process_start_unix": 1787901084,
+  "truncated": false,
+  "namespaces": [
+    {"namespace": "default:openai:gpt-4o:b4c28133aa120472", "hits": 5290,
+     "input_tokens": 1861400, "output_tokens": 399872,
+     "cost_micros": 8652220, "unpriced_tokens": 0}
+  ]
+}
+```
+
+Money is integer micro-USD, priced by the same `[pricing.<model>]` table as
+everything else; a row whose model has no rule carries `cost_micros: 0` and a
+non-zero `unpriced_tokens` rather than a guessed figure.
+
+**Why this is not a metric family.** The namespace is derived from the request,
+so per-namespace series would be caller-controlled Prometheus cardinality —
+the same reason `/metrics` carries no per-model series. The breakdown is a
+bounded JSON document instead: at most 512 namespaces are tracked and the rest
+fold into one `(other namespaces)` row, with `truncated` saying when that
+happened. `recall status` prints the top rows, and `recall export` carries them
+as `by_namespace`.
+
 ### `GET /healthz` and `GET /metrics`
 
 `/healthz` → `ok` (liveness for LB checks). `/metrics` → Prometheus text
@@ -125,14 +158,87 @@ namespace / outcome / out-of-range score.
 | metric | type | meaning |
 |---|---|---|
 | `recall_requests_total` | counter | Proxy-flavor requests received (`/v1/chat/completions` + `/v1/messages`). |
-| `recall_hits_total` / `recall_misses_total` / `recall_bypass_total` | counter | Disposition counts. |
+| `recall_hits_total` / `recall_misses_total` / `recall_bypass_total` | counter | Disposition counts. A **miss** is counted at lookup time for every cacheable request the cache could not answer — including ones whose upstream forward then failed or returned a non-cacheable body — so `hits / (hits + misses)` is a rate over cacheable traffic, not over stored entries. |
 | `recall_upstream_errors_total` | counter | Upstream forwarding failures (the 502s). |
 | `recall_tokens_saved_total` | counter | Upstream tokens **not purchased** because a hit answered (from the stored body's `usage`). |
 | `recall_input_tokens_saved_total` / `recall_output_tokens_saved_total` | counter | The saved tokens split by price tier (output costs 3–5× input; price them separately). |
+| `recall_cost_saved_usd_total` | counter | Upstream spend avoided, priced with **your** `[pricing.<model>]` rates ([CONFIG](./CONFIG.md#pricingmodel--report-savings-in-dollars)). `0` when no rates are configured — recall ships no price list and makes no network call. |
+| `recall_unpriced_tokens_saved_total` | counter | Tokens saved for models with **no** configured rule. They contribute `$0` above and are flagged here instead, so an incomplete price table reads as *unpriced* rather than as *no savings*. |
+| `recall_hits_usage_unknown_total` | counter | Hits whose stored completion reported no token usage at all (e.g. an OpenAI stream cached without `stream_options.include_usage`). They credit nothing to the counters above, so a non-zero value means the savings are an **under-count**, not an idle cache. |
+| `recall_feedback_agree_total` / `recall_feedback_wrong_total` | counter | Served hits reported correct / wrong via `/v1/cache/feedback`. `wrong / (agree + wrong)` is the **observed** false-hit rate. Counted at the proxy, so they record the judgement even under `--policy static`, which accepts feedback without learning from it. |
+| `recall_cache_entries` | gauge | Completions the store currently holds, read live at scrape time (cheap on both backends — a map length or a B-tree metadata read). Correct across a restart that rehydrated a durable store. |
+| `recall_ambiguity_miss_total` | counter | Would-be hits demoted to misses by the second-neighbour ambiguity gate (`--ambiguity-eps`). `0` while the gate is disarmed, which is the default. Read against `recall_hits_total` to see what the gate costs in hit-rate for the false hits it prevents. |
+| `recall_ledger_since_time_seconds` | gauge | Unix time the node's **persisted** savings ledger began (`--savings-flush-secs`). `0` — the default — means the counters reset with this process, i.e. `recall_process_start_time_seconds` is the boundary. Non-zero means they predate it. |
+| `recall_fill_entries_total` | counter | Entries this process bought from the upstream and stored. Credited when the write **succeeds** — a miss that was not stored bought nothing for the cache. |
+| `recall_fill_tokens_total` | counter | Upstream tokens purchased on responses this process then stored, with `recall_fill_input_tokens_total` / `recall_fill_output_tokens_total` beside it. The mirror of the saved counters, in the other direction. |
+| `recall_fill_cost_usd_total` | counter | What filling this cache cost, priced from the same `[pricing.<model>]` table as the savings — so `saved / fill` is this instance's payback. |
+| `recall_unpriced_fill_tokens_total` / `recall_fill_usage_unknown_total` | counter | The two ways the fill cost can under-count: a model with no price rule, and a response that reported no usage. |
+| `recall_persisted_entries_at_start` / `recall_rehydrated_entries` | gauge | Rows the store held at process start, and how many were rebuilt into the live index — "recovered N of M". Both 0 on an ephemeral backend, which has nothing to rebuild. |
+| `recall_process_start_time_seconds` | gauge | Unix time this process started: the boundary its counters reset at, so `increase()` across a restart stays interpretable. |
+| `recall_store_info{backend,durable}` | gauge | Constant 1; the labels carry the store backend and whether it survives a restart. Disambiguates `recall_rehydrated_entries 0` between "nothing to rebuild" and "recovered nothing". |
 | `recall_stream_not_stored_total` | counter | Streamed misses forwarded but not cached (dirty stream end — no `[DONE]`/`message_stop`, truncation, non-UTF-8). |
 | `recall_cache_get_duration_seconds` | histogram | End-to-end lookup latency (exact-hash → embed → ANN → decide) for cacheable requests. |
 | `recall_upstream_duration_seconds` | histogram | Upstream forward latency for buffered (non-streamed) calls. |
 | `recall_hit_ratio` | gauge | `hits / (hits + misses)` — over cacheable traffic only (bypasses excluded). |
+
+## Export format (`recall export` — `recall.export/v1`)
+
+One node's cumulative savings and usage as a single JSON document — the stable shape to build
+roll-up, reporting, or chargeback tooling on. Where `/metrics` is for scrapers and `recall status`
+is for humans, this is for **your** machines: pipe it into whatever aggregates your fleet.
+
+```bash
+recall export --target http://127.0.0.1:8080 > node-a.json
+```
+
+```json
+{
+  "schema": "recall.export/v1",
+  "export_id": "7b796189124e1f88d6f883d25f845da4",
+  "exported_at_unix_ms": 1787098498447,
+  "target": "http://127.0.0.1:8080",
+  "node":     { "process_start_unix": 1787098498, "store_backend": "memory", "store_durable": false,
+                "cache_entries": 4, "persisted_entries_at_start": 0, "rehydrated_entries": 0 },
+  "traffic":  { "requests": 200, "hits": 196, "misses": 4, "bypass": 0,
+                "upstream_errors": 0, "stream_not_stored": 0 },
+  "saved":    { "tokens": 5684, "input_tokens": 2352, "output_tokens": 3332,
+                "cost_micros": 39200, "unpriced_tokens": 0, "hits_usage_unknown": 0 },
+  "fill":     { "entries": 4, "tokens": 116, "input_tokens": 48, "output_tokens": 68,
+                "cost_micros": 800, "unpriced_tokens": 0, "usage_unknown": 0 },
+  "feedback": { "agree": 0, "wrong": 0 },
+  "by_namespace": [
+    { "namespace": "default:openai:gpt-4o:b4c28133aa120472", "hits": 196,
+      "input_tokens": 2352, "output_tokens": 3332,
+      "cost_micros": 39200, "unpriced_tokens": 0 }
+  ]
+}
+```
+
+`by_namespace` is `saved` split by cache namespace (see
+[`GET /v1/cache/namespaces`](#get-v1cachenamespaces--savings-split-by-namespace)) — added under
+the existing schema, so a consumer written before it simply ignores it. It is empty when the
+exporter could not read that document (an older node, or one behind a router exposing only
+`/metrics`), which is why the node-level `saved` stays authoritative and these rows are strictly
+a breakdown of it.
+
+**Contract rules** (source: `crates/recall-proxy/src/export.rs`):
+
+- **Versioned, additive-only.** `schema` is always the first key, so a consumer can dispatch on a
+  prefix read. New fields may appear within `recall.export/v1` and must be ignored if unknown; a
+  shipped field never changes name, type, or meaning. A breaking change means a new schema string.
+- **Integer money.** Every monetary field is integer **micro-USD** (`*_micros`) — the exact value
+  recall accounts internally, no float in the document. Divide by 1e6 at your edge.
+- **Under-counts are flagged, never folded away.** `unpriced_tokens` (models with no
+  `[pricing.<model>]` rule) and `*usage_unknown` (responses that reported no usage) ride alongside
+  every dollar figure; a `cost_micros` of `0` next to non-zero flags means "unpriced", not
+  "nothing saved". `feedback` ships raw counts so `0/0` (unmeasured) stays distinct from a
+  measured 0% false-hit rate.
+- **Everything is cumulative since `node.process_start_unix`.** A consumer differencing successive
+  exports uses it to tell a counter reset (restart) from a quiet period.
+- **`export_id` is content-derived** (time + target + process identity + counters): an exact
+  retransmission of the same document carries the same id, so an ingest ledger keyed on it can
+  accept a fire-and-forget retry without double-counting, while any counter movement or later
+  timestamp yields a fresh id.
 
 ## Library API (`recall-core`)
 

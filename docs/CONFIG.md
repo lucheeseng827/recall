@@ -11,7 +11,7 @@ regenerate these tables when those change. A commented reference config ships as
 - [`recall serve`](#recall-serve) — the proxy (flags, env, TOML keys)
 - [Env-only settings](#env-only-settings) (API keys, logging)
 - [Hot reload](#hot-reload---watch-config)
-- [Other subcommands](#other-subcommands) — `ask` / `bench` / `replay` / `ann-bench` / `calibrate`
+- [Other subcommands](#other-subcommands) — `ask` / `bench` / `replay` / `status` / `export` / `ann-bench` / `calibrate`
 - [Cargo features](#cargo-features)
 - [Fixed internals](#fixed-internals-library-defaults)
 - [State & data formats](#state--data-formats)
@@ -31,10 +31,48 @@ regenerate these tables when those change. A commented reference config ships as
 | `--target-fhr` | `RECALL_TARGET_FHR` | `target_fhr` | f64 | `0.02` | False-hit rate the adaptive policy aims to hold (0.02 = ≤2% wrong hits among served hits). | Your correctness budget. |
 | `--model` | `RECALL_MODEL2VEC_PATH` | `model` | dir path | *(none → hash embedder)* | Local model2vec/potion model directory (offline; no download). Requires a `--features static` build — without it the flag is **ignored with a note** and the deterministic hash embedder is used. | Any production deploy (real paraphrase hits). |
 | `--index` | `RECALL_INDEX` | `index` | `brute` \| `hnsw` | `brute` | ANN index. `brute` = exact oracle (O(N) per lookup); `hnsw` = pure-Rust approximate, sublinear at scale. Unknown value → exit 2. | Corpus ≳10k entries per namespace (validate with `recall ann-bench` first). |
+| `--hnsw-m` | `RECALL_HNSW_M` | `hnsw_m` | usize | `32` | HNSW graph degree (`m0 = 2·m` on layer 0). Only with `--index hnsw`. Higher = better recall, more memory and insert cost. | `ann-bench` shows recall@1 short of the gate for your dims/N. |
+| `--hnsw-ef-construction` | `RECALL_HNSW_EF_CONSTRUCTION` | `hnsw_ef_construction` | usize | `400` | Candidate breadth while building the graph. Higher = better graph, slower insert (a miss-path cost). | Same. |
+| `--hnsw-ef-search` | `RECALL_HNSW_EF_SEARCH` | `hnsw_ef_search` | usize | `256` | Candidate breadth while searching — THE recall-vs-latency dial at query time. | Raise first when recall@1 falls short (see BENCHMARKS.md: 0.998 at 10k, 0.876 at 50k on the adversarial workload); lower to shave hit latency on small corpora. |
+| `--ambiguity-eps` | `RECALL_AMBIGUITY_EPS` | `ambiguity_eps` | f32 | `0` (off) | Second-neighbour ambiguity gate: a would-be hit whose top-2 neighbours are within this similarity of each other AND store *different* answers is served as a miss (same-answer near-duplicates replay regardless). Demotions counted by `recall_ambiguity_miss_total`. | Trimming false hits on lookalike-heavy corpora; start ~0.01–0.05 and watch that counter against `recall_hits_total`. |
+| `--savings-flush-secs` | `RECALL_SAVINGS_FLUSH_SECS` | `savings_flush_secs` | u64 | `0` (off) | Persist the savings counters into the durable store every N seconds, so the `$ saved` figure survives a restart rather than resetting each deploy. Requires `--store redb`. A clean shutdown flushes on the way out, so a planned deploy loses nothing; an unclean exit loses at most N seconds of accounting. When on, the node reports `recall_ledger_since_time_seconds` (and `recall export` carries `node.ledger_since_unix`) so a consumer can tell the counters predate this process. | You quote the savings figure across deploys. |
 | `--store` | `RECALL_STORE` | `store` | `memory` \| `redb` | `memory` | Store backend. `memory` is ephemeral; `redb` is durable/ACID and **rehydrates on restart** (rebuilds the in-memory index + exact-map from persisted entries). `redb` on a build without `--features store-redb`, an unknown value, or a redb open failure → **exit 2**, never a silent downgrade. | Cache must survive restarts. |
 | `--db-path` | `RECALL_DB_PATH` | `db_path` | file path | `recall.redb` | Where redb persists (only with `--store redb`). One live instance per file — redb is single-writer. | Put it on the instance's durable volume. |
 | `--watch-config` | — | — | bool flag | off | Hot-reload the **threshold policy only** (`policy`/`tau`/`target_fhr`) from `--config` on file change; requires `--config`. See [Hot reload](#hot-reload---watch-config). | Live τ tuning without dropping connections. |
 | `--config` | — | — | file path | *(none)* | The TOML file (lowest precedence). Every key optional. | — |
+
+### `[pricing.<model>]` — report savings in dollars
+
+File-only (a rate table is not a scalar, so there is no flag or env form), optional,
+and **not** hot-reloadable. Each entry gives your **USD per million tokens** — the unit
+providers publish — for one model:
+
+```toml
+[pricing."gpt-4o"]
+input = 2.50      # USD per 1M input (prompt) tokens
+output = 10.00    # USD per 1M output (completion) tokens
+
+[pricing."gpt-4o-mini*"]   # prefix rule: also covers gpt-4o-mini-2024-07-18
+input = 0.15
+output = 0.60
+```
+
+With at least one rule configured, `/metrics` exports
+`recall_cost_saved_usd_total` next to the raw token counters.
+
+| rule | behavior |
+|---|---|
+| Your numbers only | recall bundles no price list and makes no network call. An empty table (the default) is a supported state: the dollar figure stays `0` and `serve` says so at startup. |
+| Never guessed | A model with no matching rule contributes `$0` and its saved tokens are counted in `recall_unpriced_tokens_saved_total` — so an incomplete or typo'd table reads as *unpriced*, not as *no savings*. |
+| Exact by default | A bare key matches the model id exactly; a key ending in `*` is a prefix rule, so `"gpt-4o*"` covers dated snapshots. When several match, the **longest stem** wins. |
+| Case-sensitive | Keys match the model id byte-for-byte as the caller sends it: `"GPT-4o"` does not match `gpt-4o`. A mismatched-case key silently prices nothing — its tokens land in `recall_unpriced_tokens_saved_total`, which is where to look when the dollar figure is unexpectedly `0`. |
+| Input ≠ output | The two tiers are priced separately (output typically costs 3–5× input), so a skewed mix is not mis-stated. |
+| Integer money | Rates convert to integer micro-USD at load and accumulate as integers, so millions of hits don't drift; the float appears only in the exposition (6 dp). |
+| Non-fatal | A negative, NaN, infinite, or empty-key entry is warned about and skipped — a typo in an optional reporting table never stops the proxy from serving. |
+
+To price a workload *before* deploying, `recall replay` takes flat
+`--price-input` / `--price-output` rates for a single run — see
+[below](#recall-replay--drive-a-running-serve-with-a-request-log).
 
 ## Env-only settings
 
@@ -79,17 +117,69 @@ All in-process except `replay` (HTTP client). Source: `cmd_*` in
 
 ### `recall replay` — drive a running `serve` with a request log
 
+Measures what a log of real requests *would* have saved — run it against a throwaway
+proxy before putting recall in your request path. Walkthrough:
+[GETTING_STARTED §4](./GETTING_STARTED.md#4-measure-it-on-your-own-traffic--before-you-commit).
+
 | flag | type | default | what it does |
 |---|---|---|---|
-| `--file` | path | **required** | JSONL request log, one request body per line. |
+| `--file` | path | **required** | JSONL request log, one request body per line (or `{"path":…,"body":…}` to mix endpoints). |
 | `--target` | URL | `http://127.0.0.1:8080` | The running proxy. |
 | `--path` | string | `/v1/chat/completions` | Default request path for lines that don't carry one. |
-| `--verify-sample` | f64 in [0,1] | `0.0` | Fraction of hits re-asked to the upstream to sample the candidate false-hit rate. Needs `--upstream`. |
+| `--verify-sample` | f64 in [0,1] | `0.0` | Fraction of hits re-asked to the upstream and compared, to sample the false-hit rate. Needs `--upstream`, and only means anything at `temperature: 0`. When set, the savings are reported **both** gross and net of the measured rate. |
 | `--upstream` | URL | `RECALL_UPSTREAM` | Upstream for verification calls (key from `RECALL_UPSTREAM_API_KEY` / `RECALL_ANTHROPIC_API_KEY`). |
-| `--price-input` / `--price-output` | f64 $/Mtok | — | Price the saved tokens into a dollar estimate. |
+| `--price-input` / `--price-output` | f64 $/Mtok | — | **Fallback** pricing for a target with no price book: one blended rate across every model in the log. Ignored when the target reports a per-model figure. |
+
+The headline `$ saved` comes from the target's own
+[`[pricing.<model>]`](#pricingmodel--report-savings-in-dollars) table, so a log spanning
+several models is priced per model rather than at one blended rate. Every figure is a
+**delta** across the run (the proxy's counters are snapshotted before and after), so
+replaying twice against one long-lived proxy measures the second run rather than both
+added together; the reported hit-rate is likewise the run's own, not the proxy's
+lifetime gauge.
 
 Exit is non-zero when **every** request errored (proxy unreachable) so CI sees red
 instead of a misleading 0% hit-rate.
+
+### `recall status` — one screen on a running `serve`
+
+Summarizes a live proxy: what it has saved, and what that figure does and does not
+account for. Reads `/metrics` over HTTP and computes nothing the proxy did not
+already measure.
+
+| flag | type | default | what it does |
+|---|---|---|---|
+| `--target` | URL | `RECALL_TARGET`, else `http://127.0.0.1:8080` | The running proxy to summarize. |
+| `--json` | bool flag | off | Emit the raw snapshot as JSON instead of the formatted summary — for piping into your own tooling. |
+
+Every caveat it prints is measured, never assumed:
+
+- Savings are discounted by the **observed** false-hit rate when outcomes have been
+  reported to [`/v1/cache/feedback`](./API.md), and explicitly labelled
+  un-discounted when none have. No feedback is not a 0% error rate.
+- Saved tokens on models with no price rule, and hits whose stored completion
+  carried no usage at all, are called out as **under-counts** rather than folded
+  away — a figure that is quietly too low costs trust as fast as one that is too high.
+- A rate with no denominator abstains ("no cacheable traffic yet", "unmeasured")
+  rather than printing `0.0%`.
+
+Exit is non-zero when the proxy cannot be reached, so a monitoring wrapper sees the
+difference between "down" and "idle".
+
+### `recall export` — the node's facts as one versioned JSON document
+
+Emits everything `status` shows — savings, fill cost, traffic, store facts, feedback — as a
+`recall.export/v1` document for machine consumption: roll-ups, reporting, chargeback. The shape is
+a documented compatibility surface, evolved additively only — see
+[API.md](./API.md#export-format-recall-export--recallexportv1).
+
+| flag | type | default | what it does |
+|---|---|---|---|
+| `--target` | URL | `RECALL_TARGET`, else `http://127.0.0.1:8080` | The running proxy to export from. |
+
+Exit is non-zero when the proxy cannot be reached. Money is integer micro-USD; under-count flags
+ride alongside every figure; `export_id` is content-derived so an ingest ledger can dedupe a
+retried document.
 
 ### `recall ann-bench` — brute vs HNSW as N grows
 
@@ -99,6 +189,7 @@ instead of a misleading 0% hit-rate.
 | `--queries` | usize ≥ 100 | `500` | Queries per corpus size. |
 | `--sizes` | comma list | `100,1000,10000,50000` | Corpus sizes. |
 | `--top-k` | usize > 0 | `1` | HNSW recall@1 is measured against the brute-force top-1 within this k. |
+| `--m` / `--ef-construction` / `--ef-search` | usize | the `serve` defaults (32 / 400 / 256) | HNSW tunables for the benched graph — sweep these to find the recall/latency point for **your** dims/N, then set the matching `--hnsw-*` flags on `serve`. Defaulting to the serve values means a plain run benchmarks the config you actually deploy. |
 
 ### `recall calibrate` — pick τ for your embedder from labeled pairs
 

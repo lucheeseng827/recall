@@ -29,6 +29,8 @@ fn main() {
         Some("ask") => cmd_ask(&args[1..]),
         Some("bench") => cmd_bench(&args[1..]),
         Some("replay") => cmd_replay(&args[1..]),
+        Some("status") => cmd_status(&args[1..]),
+        Some("export") => cmd_export(&args[1..]),
         Some("ann-bench") => cmd_ann_bench(&args[1..]),
         Some("calibrate") => cmd_calibrate(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
@@ -51,18 +53,28 @@ fn usage() {
          USAGE:\n  \
          recall serve [--config recall.toml] [--listen addr] [--upstream url]\n               \
          [--base-namespace ns] [--max-temperature f] [--tau f] [--model dir]\n               \
-         [--index brute|hnsw] [--store memory|redb] [--db-path file] [--policy static|adaptive]\n               \
+         [--index brute|hnsw] [--hnsw-m n] [--hnsw-ef-construction n] [--hnsw-ef-search n]\n               \
+         [--ambiguity-eps f] [--store memory|redb] [--db-path file] [--policy static|adaptive]\n               \
+         [--savings-flush-secs n]  (persist the savings counters; needs --store redb)\n               \
          [--watch-config]  (hot-reload the threshold policy from --config; other fields need a restart)\n  \
          recall ask --ns <namespace> \"<prompt>\"\n  \
          recall bench [--tau <f32>] [--iters <n>] [--model <dir>]\n  \
          recall replay --file <reqs.jsonl> [--target url] [--path p] [--verify-sample r]\n               \
          [--upstream url] [--price-input <usd/Mtok>] [--price-output <usd/Mtok>]\n  \
-         recall ann-bench [--dims <d>] [--queries <q>] [--sizes 100,1000,10000] [--top-k <k>]\n  \
+         recall status [--target url] [--json]\n  \
+         recall export [--target url]\n  \
+         recall ann-bench [--dims <d>] [--queries <q>] [--sizes 100,1000,10000] [--top-k <k>]\n               \
+         [--m <n>] [--ef-construction <n>] [--ef-search <n>]\n  \
          recall calibrate --file <pairs.jsonl> [--model <dir>] [--target-fhr <r>]\n\n\
          `serve` runs the OpenAI-compatible proxy (point your client's base URL at it).\n\
          `calibrate` picks the similarity threshold for the configured embedder from a labeled\n\
          JSONL pair set ({{\"a\":..,\"b\":..,\"should_hit\":true|false}} per line).\n\
-         `replay` drives a running `serve` with a JSONL request log and reports hit-rate + tokens saved.\n\
+         `replay` drives a running `serve` with a JSONL request log and reports the dollars, tokens,\n\
+         and hit-rate that log would have saved — run it BEFORE putting recall in your request path.\n\
+         `status` summarizes a running `serve` in one screen — what it has saved, and what that\n\
+         figure does and does not account for.\n\
+         `export` emits the same facts as a versioned JSON document (recall.export/v1) — the\n\
+         stable shape to pipe into your own roll-up, chargeback, or reporting tooling.\n\
          `ann-bench` compares the brute-force and HNSW indexes (recall@1 + search latency) as N grows.\n\
          Config precedence: flags > env (RECALL_*) > --config file > defaults.\n\
          On an `ask` MISS, the completion is read from stdin and stored for next time."
@@ -292,6 +304,25 @@ struct FileConfig {
     db_path: Option<String>,
     policy: Option<String>,
     target_fhr: Option<f64>,
+    /// HNSW graph tunables, used only with `index = "hnsw"`. Defaults are validated at the bundled
+    /// embedder's 256-dim width (see BENCHMARKS.md); `ef_search` is the recall-vs-latency dial to
+    /// raise first when `ann-bench` shows recall@1 short of the gate for your dims/N.
+    hnsw_m: Option<usize>,
+    hnsw_ef_construction: Option<usize>,
+    hnsw_ef_search: Option<usize>,
+    /// Second-neighbor ambiguity gate: a would-be hit whose top-two neighbours sit within this
+    /// similarity of each other AND store different answers is served as a miss. 0 (default)
+    /// disarms it.
+    ambiguity_eps: Option<f32>,
+    /// How often (seconds) the savings counters are snapshotted into the durable store, so the
+    /// "$ saved" figure survives a restart. Only with `store = "redb"`. 0 (the default) keeps the
+    /// documented behaviour: counters reset with the process.
+    savings_flush_secs: Option<u64>,
+    /// `[pricing.<model>]` — the operator's own USD-per-million-token rates, used to turn saved
+    /// tokens into `recall_cost_saved_usd_total`. File-only (there is no flag or env form: a rate
+    /// table is not a scalar), optional, and empty by default — recall ships no price list.
+    #[serde(default)]
+    pricing: std::collections::HashMap<String, recall_proxy::pricing::RateSpec>,
 }
 
 /// Deterministic L2-normalized random vectors from a seed (no `rand` dependency — a small xorshift
@@ -337,6 +368,20 @@ fn cmd_ann_bench(args: &[String]) -> i32 {
     let sizes: Vec<usize> = flag(args, "--sizes")
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![100, 1_000, 10_000, 50_000]);
+    // HNSW tunables, defaulting to the shipped `HnswConfig::default()` — the same graph `serve
+    // --index hnsw` builds — so a plain `ann-bench` run validates the real deployed config, and
+    // the flags let an operator sweep for THEIR dims/N before opting in at scale.
+    let hnsw_defaults = recall_index::HnswConfig::default();
+    let hnsw_m: usize = flag(args, "--m")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(hnsw_defaults.m);
+    let hnsw_efc: usize = flag(args, "--ef-construction")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(hnsw_defaults.ef_construction);
+    let hnsw_efs: usize = flag(args, "--ef-search")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(hnsw_defaults.ef_search);
+    let cfg = recall_index::HnswConfig::with_params(hnsw_m, hnsw_efc, hnsw_efs);
     if queries < 100 || sizes.is_empty() || top_k == 0 {
         eprintln!(
             "recall ann-bench: --queries must be ≥ 100 for meaningful percentiles; --top-k and at least one --sizes value must be > 0"
@@ -368,7 +413,10 @@ fn cmd_ann_bench(args: &[String]) -> i32 {
             (times, results)
         };
 
-    println!("recall ann-bench  (dims: {dims}, queries: {queries}, top-k: {top_k})");
+    println!(
+        "recall ann-bench  (dims: {dims}, queries: {queries}, top-k: {top_k}, \
+         hnsw: m={hnsw_m} ef_construction={hnsw_efc} ef_search={hnsw_efs})"
+    );
     println!(
         "  {:>8} | {:>16} | {:>16} | {:>8} | {:>9}",
         "corpus", "brute p50/p99 µs", "hnsw p50/p99 µs", "speedup", "recall@1"
@@ -376,7 +424,7 @@ fn cmd_ann_bench(args: &[String]) -> i32 {
     for &n in &sizes {
         let corpus = gen_normalized(n, dims, 0xC0DE_F00D);
         let brute = BruteForceIndex::new();
-        let hnsw = recall_index::HnswIndex::new();
+        let hnsw = recall_index::HnswIndex::with_config(cfg);
         for (i, v) in corpus.iter().enumerate() {
             let key = Key::derive(ns, &i.to_string());
             brute.insert(ns, key, v).expect("brute insert");
@@ -619,8 +667,73 @@ fn cmd_calibrate(args: &[String]) -> i32 {
     0
 }
 
+/// Print the savings block — the headline of a replay run.
+///
+/// The dollar figure comes from the proxy's own per-model pricing (`recall_cost_saved_usd_total`)
+/// whenever the target has a `[pricing.<model>]` table; that is the only way a log spanning several
+/// models is priced correctly. `--price-input`/`--price-output` remain as a fallback for a target
+/// with no price book, and are labeled as what they are: one blended rate across every model in the
+/// log. When neither is available the line says how to get a number rather than printing `$0.00`,
+/// which would read as "the cache saved nothing".
+///
+/// Where a false-hit rate was actually measured (`--verify-sample`), the discounted figure is
+/// printed **next to** the gross one. A wrong hit is not a saving — it bought a wrong answer with
+/// the money it did not spend — and an ROI number quoted gross when a measured error rate exists is
+/// the kind that gets a cache ripped back out a quarter later. With no sampling, the un-discounted
+/// figure is labeled as such instead of being silently passed off as verified.
+fn print_savings(
+    rep: &recall_proxy::replay::ReplayReport,
+    price_input: Option<f64>,
+    price_output: Option<f64>,
+) {
+    if rep.cost_saved_micros > 0 {
+        println!(
+            "  $ saved         : ${:.4}   (priced per model by the target's [pricing] table)",
+            rep.cost_saved_usd()
+        );
+        match rep.cost_saved_usd_discounted() {
+            Some(net) => println!(
+                "                    ${net:.4} less the {:.1}% sampled false-hit rate",
+                rep.sampled_false_hit_rate().unwrap_or(0.0) * 100.0
+            ),
+            None => println!(
+                "                    not discounted for wrong hits — add --verify-sample to measure them"
+            ),
+        }
+        if rep.unpriced_tokens_saved > 0 {
+            println!(
+                "                    understated: {} saved tokens were on models with no price rule",
+                rep.unpriced_tokens_saved
+            );
+        }
+        return;
+    }
+    // No per-model figure. Fall back to the flat rates, or explain how to get a real one.
+    match (price_input, price_output) {
+        (Some(pi), Some(po)) => {
+            let usd = rep.input_tokens_saved as f64 / 1e6 * pi
+                + rep.output_tokens_saved as f64 / 1e6 * po;
+            println!(
+                "  $ saved (est.)  : ${usd:.4}   (one blended rate: in ${pi}/Mtok, out ${po}/Mtok)"
+            );
+        }
+        // $0 has several causes and the snapshot can tell most of them apart (same
+        // disambiguation as `recall status`): blaming a missing price book when one exists
+        // sends the user to fix something that is not broken.
+        _ if rep.unpriced_tokens_saved > 0 => println!(
+            "  $ saved         : not priced — the hits were on models with no matching [pricing.<model>]\n                    rule on the target (its table exists but does not cover this log's models)"
+        ),
+        _ if rep.hits_usage_unknown > 0 => println!(
+            "  $ saved         : not priced — the replayed completions reported no token usage to price"
+        ),
+        _ => println!(
+            "  $ saved         : not priced — give the target a [pricing.<model>] table (see recall.toml),\n                    or pass --price-input/--price-output <usd per 1M tokens> for a flat estimate"
+        ),
+    }
+}
+
 /// `recall replay --file <reqs.jsonl>`: drive a running `serve` with a request log and report the
-/// hit-rate and token savings it produced (the validation step for the "we saved $X" claim).
+/// hit-rate and dollar savings it produced (the validation step for the "we saved $X" claim).
 fn cmd_replay(args: &[String]) -> i32 {
     let Some(file) = flag(args, "--file") else {
         eprintln!("recall replay: --file <reqs.jsonl> is required");
@@ -694,33 +807,28 @@ fn cmd_replay(args: &[String]) -> i32 {
     };
 
     println!("recall replay  (target: {target}, {total_lines} lines)");
-    println!("  requests        : {}", rep.requests);
-    println!("  hits            : {}", rep.hits);
-    println!("  misses          : {}", rep.misses);
-    println!("  bypass          : {}", rep.bypass);
-    println!("  errors          : {}", rep.errors);
+    // The money first: it is the line an engineer forwards to whoever owns the budget, and every
+    // other number here exists to let that person check it.
+    print_savings(&rep, price_input, price_output);
     println!(
-        "  hit-rate        : {:.1}%  (over cacheable)",
-        rep.hit_ratio * 100.0
+        "  hit-rate        : {:.1}%  ({} of {} cacheable)",
+        rep.hit_ratio * 100.0,
+        rep.hits,
+        rep.hits + rep.misses
     );
-    println!("  tokens saved    : {} total", rep.tokens_saved);
-    println!("    input         : {}", rep.input_tokens_saved);
-    println!("    output        : {}", rep.output_tokens_saved);
-    match (price_input, price_output) {
-        (Some(pi), Some(po)) => {
-            let usd = rep.input_tokens_saved as f64 / 1e6 * pi
-                + rep.output_tokens_saved as f64 / 1e6 * po;
-            println!("  est. saved      : ${usd:.4}  (in ${pi}/Mtok, out ${po}/Mtok)");
-        }
-        _ => println!(
-            "  est. saved      : (pass --price-input/--price-output <usd per 1M tokens> to price)"
-        ),
-    }
+    println!(
+        "  tokens saved    : {} total  (input {}, output {})",
+        rep.tokens_saved, rep.input_tokens_saved, rep.output_tokens_saved
+    );
+    println!(
+        "  requests        : {}  (hits {}, misses {}, bypass {}, errors {})",
+        rep.requests, rep.hits, rep.misses, rep.bypass, rep.errors
+    );
     if rep.verified > 0 {
-        let fhr = rep.verify_mismatch as f64 / rep.verified as f64 * 100.0;
+        let fhr = rep.sampled_false_hit_rate().unwrap_or(0.0) * 100.0;
         println!(
-            "  verify          : {} sampled, {} mismatch ({fhr:.1}% candidate false-hit), {} unchecked",
-            rep.verified, rep.verify_mismatch, rep.verify_unchecked
+            "  false-hit       : {fhr:.1}% sampled  ({} of {} checked disagreed with a fresh upstream answer, {} unchecked)",
+            rep.verify_mismatch, rep.verified, rep.verify_unchecked
         );
     }
     // A run where every request errored exercised nothing (proxy unreachable, upstream down, malformed
@@ -733,6 +841,308 @@ fn cmd_replay(args: &[String]) -> i32 {
         return 1;
     }
     0
+}
+
+/// `recall status [--target url]`: one screen summarizing a running `serve`.
+///
+/// This is the thing an engineer forwards to whoever owns the budget, so it leads with the money
+/// and then says, in the same breath, what that number does and does not account for. Every caveat
+/// printed here is measured, not assumed:
+///
+/// - the savings are discounted by the **observed** false-hit rate when feedback has been reported,
+///   and explicitly labelled un-discounted when none has — never silently treated as error-free;
+/// - saved tokens on models with no price rule, and hits whose stored completion carried no usage
+///   at all, are called out as *under-counts* rather than folded away, because a figure that is
+///   quietly too low erodes trust exactly as fast as one that is too high.
+///
+/// It reads `/metrics` over HTTP and computes nothing the proxy did not already measure.
+/// What window the node's cumulative counters actually cover, in words.
+///
+/// "since this process started" is right — and was the only possibility — until a node could
+/// persist its counters. With `--savings-flush-secs` on they span the ledger instead, and saying
+/// otherwise would understate a figure by exactly the history the operator turned persistence on
+/// to keep. A node that predates the ledger reports `0` and reads as before.
+fn counter_window(snap: &recall_proxy::scrape::Snapshot) -> String {
+    if snap.ledger_since_unix == 0 {
+        return "since this process started".to_string();
+    }
+    match snap
+        .process_start_unix
+        .checked_sub(snap.ledger_since_unix)
+        .filter(|gap| *gap > 0)
+    {
+        // The ledger predates this process: report how much history it carries, since that is the
+        // whole reason the number is worth quoting after a deploy.
+        Some(gap) => format!("over the {} the ledger has run", human_duration(gap)),
+        // Same instant (or a clock that moved backwards): this ledger began with this process.
+        None => "since this ledger began, with this process".to_string(),
+    }
+}
+
+/// A coarse, human duration — days/hours/minutes. Deliberately approximate: this labels a figure,
+/// it is not the figure.
+fn human_duration(secs: u64) -> String {
+    match secs {
+        s if s >= 172_800 => format!("{} days", s / 86_400),
+        s if s >= 7_200 => format!("{} hours", s / 3_600),
+        s if s >= 120 => format!("{} minutes", s / 60),
+        s => format!("{s} seconds"),
+    }
+}
+
+fn cmd_status(args: &[String]) -> i32 {
+    let target = flag(args, "--target")
+        .map(str::to_string)
+        .or_else(|| std::env::var("RECALL_TARGET").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let as_json = args.iter().any(|a| a == "--json");
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("recall status: failed to start runtime: {e}");
+            return 1;
+        }
+    };
+    let snap = match rt.block_on(recall_proxy::scrape::fetch_url(&target)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("recall status: {e}");
+            return 1;
+        }
+    };
+
+    if as_json {
+        match serde_json::to_string_pretty(&snap) {
+            Ok(j) => println!("{j}"),
+            Err(e) => {
+                eprintln!("recall status: cannot render json: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    println!("recall status  (target: {target})");
+    match snap.cost_saved_micros {
+        // $0 has several causes and the snapshot can tell most of them apart. Naming the wrong one
+        // sends an operator to fix a price book that is already correct.
+        0 => {
+            let why = if snap.hits == 0 {
+                "no hits yet"
+            } else if snap.unpriced_tokens_saved > 0 {
+                "hits so far were on models with no matching [pricing.<model>] rule"
+            } else if snap.hits_usage_unknown > 0 {
+                "the completions replayed so far reported no token usage to price"
+            } else {
+                "add a [pricing.<model>] table to the proxy's config (see recall.toml)"
+            };
+            println!("  $ saved         : not priced — {why}");
+        }
+        _ => {
+            // The window is part of the figure: "$18,400" means nothing without "over what". It is
+            // only spelled out once the ledger outlives the process, since until then every reader
+            // already knew the answer was "this process".
+            if snap.ledger_since_unix > 0 {
+                println!(
+                    "  $ saved         : ${:.4}   ({})",
+                    snap.cost_saved_usd(),
+                    counter_window(&snap)
+                );
+            } else {
+                println!("  $ saved         : ${:.4}", snap.cost_saved_usd());
+            }
+            match snap.cost_saved_usd_discounted() {
+                Some(net) => println!(
+                    "                    ${net:.4} less the {:.1}% observed false-hit rate",
+                    snap.observed_false_hit_rate().unwrap_or(0.0) * 100.0
+                ),
+                None => println!(
+                    "                    not discounted for wrong hits — none have been reported to /v1/cache/feedback"
+                ),
+            }
+        }
+    }
+    match snap.hit_rate() {
+        Some(r) => println!(
+            "  hit-rate        : {:.1}%  ({} of {} cacheable)",
+            r * 100.0,
+            snap.hits,
+            snap.hits + snap.misses
+        ),
+        None => println!("  hit-rate        : no cacheable traffic yet"),
+    }
+    println!(
+        "  tokens saved    : {} total  (input {}, output {})",
+        snap.tokens_saved, snap.input_tokens_saved, snap.output_tokens_saved
+    );
+    // The fill side: what this process paid to build the cache it now holds. Reported next to the
+    // savings because it is the denominator of the same question, and deliberately not framed as
+    // anything more: every cache pays to be filled once, on one node or on fifty, so this is the
+    // price of having a cache — not evidence of any particular topology. What running N of them
+    // costs is arithmetic over N nodes' series, which belongs to whatever scrapes them all.
+    if snap.fill_entries > 0 {
+        let cost = if snap.fill_cost_micros > 0 {
+            format!("  (${:.4} at the configured rates)", snap.fill_cost_usd())
+        } else {
+            String::new()
+        };
+        println!(
+            "  filled          : {} entries bought and stored {window}{cost}",
+            snap.fill_entries,
+            window = counter_window(&snap)
+        );
+    }
+    println!(
+        "  entries         : {} held by the store",
+        snap.cache_entries
+    );
+    if snap.rehydrated_entries > 0 || snap.persisted_entries_at_start > 0 {
+        println!(
+            "  recovered       : {} of {} persisted entries rebuilt at start-up",
+            snap.rehydrated_entries, snap.persisted_entries_at_start
+        );
+    }
+    // Not a partition of `requests`, and formatted so it does not read as one: a miss whose
+    // upstream forward then failed is counted in both `misses` and `upstream errors`, and a request
+    // rejected before it reached the cache is in none of them.
+    println!(
+        "  requests        : {}   hits {} · misses {} · bypass {} · upstream errors {}",
+        snap.requests, snap.hits, snap.misses, snap.bypass, snap.upstream_errors
+    );
+    let judged = snap.feedback_agree + snap.feedback_wrong;
+    match snap.observed_false_hit_rate() {
+        Some(fhr) => println!(
+            "  false-hit       : {:.1}% observed  ({} of {} judged hits reported wrong)",
+            fhr * 100.0,
+            snap.feedback_wrong,
+            judged
+        ),
+        None => println!(
+            "  false-hit       : unmeasured — no outcomes reported to POST /v1/cache/feedback"
+        ),
+    }
+
+    // Everything below is a caveat on the figures above. Printed only when it applies, so a clean
+    // deployment gets a clean screen and a caveat always means something.
+    let mut caveats = Vec::new();
+    if snap.unpriced_tokens_saved > 0 {
+        caveats.push(format!(
+            "$ saved understates: {} saved tokens were on models with no price rule",
+            snap.unpriced_tokens_saved
+        ));
+    }
+    if snap.hits_usage_unknown > 0 {
+        caveats.push(format!(
+            "$ saved and tokens saved understate: {} hits replayed a completion that reported no token usage",
+            snap.hits_usage_unknown
+        ));
+    }
+    if snap.unpriced_fill_tokens > 0 {
+        caveats.push(format!(
+            "fill cost understates: {} purchased tokens were on models with no price rule",
+            snap.unpriced_fill_tokens
+        ));
+    }
+    if snap.fill_usage_unknown > 0 {
+        caveats.push(format!(
+            "fill cost understates: {} stored entries came from a response that reported no token usage",
+            snap.fill_usage_unknown
+        ));
+    }
+    if snap.stream_not_stored > 0 {
+        caveats.push(format!(
+            "{} streamed misses were not cached (stream ended without its terminator, or truncated)",
+            snap.stream_not_stored
+        ));
+    }
+    if !caveats.is_empty() {
+        println!("  caveats         :");
+        for c in caveats {
+            println!("                    - {c}");
+        }
+    }
+    // Where the savings came from. Only the top rows: this is a status screen, and the full list
+    // is one `curl /v1/cache/namespaces` away. Absent entirely on a node that predates the
+    // endpoint, which is why nothing above depends on it.
+    if !snap.by_namespace.is_empty() {
+        const SHOWN: usize = 5;
+        println!("  top namespaces  :");
+        for row in snap.by_namespace.iter().take(SHOWN) {
+            let dollars = if row.unpriced_tokens > 0 && row.cost_micros == 0 {
+                "unpriced".to_string()
+            } else {
+                format!("${:.4}", row.cost_micros as f64 / 1e6)
+            };
+            println!(
+                "                    {:>10}  {:<44} ({} hits)",
+                dollars, row.namespace, row.hits
+            );
+        }
+        if snap.by_namespace.len() > SHOWN {
+            println!(
+                "                    … {} more (GET /v1/cache/namespaces for all)",
+                snap.by_namespace.len() - SHOWN
+            );
+        }
+    }
+    0
+}
+
+/// `recall export [--target url]`: the node's savings and usage as one versioned JSON document.
+///
+/// Where `status` is a screen for a human, `export` is a shape for a machine: `recall.export/v1`,
+/// documented in API.md, evolved additively only. Money is integer micro-USD, the under-count
+/// flags ride alongside every figure, and `export_id` is content-derived so an ingest ledger can
+/// accept the same document twice without double-counting. Pipe it wherever the roll-up lives.
+fn cmd_export(args: &[String]) -> i32 {
+    let target = flag(args, "--target")
+        .map(str::to_string)
+        .or_else(|| std::env::var("RECALL_TARGET").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("recall export: failed to start runtime: {e}");
+            return 1;
+        }
+    };
+    let snap = match rt.block_on(recall_proxy::scrape::fetch_url(&target)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("recall export: {e}");
+            return 1;
+        }
+    };
+    // A 0 stamp would be a valid-LOOKING document that the paid side silently drops as stale
+    // (every baseline is at or after it), so a broken clock must fail the command, not ship.
+    let exported_at_unix_ms = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+    {
+        Ok(d) => d.as_millis() as u64,
+        Err(e) => {
+            eprintln!("recall export: system clock is before the Unix epoch ({e}) — refusing to emit a document that would be discarded as stale");
+            return 1;
+        }
+    };
+    let doc = recall_proxy::export::build(&snap, &target, exported_at_unix_ms);
+    match serde_json::to_string_pretty(&doc) {
+        Ok(j) => {
+            println!("{j}");
+            0
+        }
+        Err(e) => {
+            eprintln!("recall export: cannot render json: {e}");
+            1
+        }
+    }
 }
 
 fn cmd_serve(args: &[String]) -> i32 {
@@ -838,6 +1248,29 @@ fn cmd_serve(args: &[String]) -> i32 {
     )
     .parse()
     .unwrap_or(0.02);
+    // The operator's price book (`[pricing.<model>]`). File-only, and deliberately non-fatal: a bad
+    // rate is warned about and skipped rather than refusing to start, because a typo in an optional
+    // reporting table must not take a cache proxy down. Both states are logged, so an operator never
+    // has to guess why `recall_cost_saved_usd_total` is zero.
+    let (pricing, rejected_rates) = recall_proxy::pricing::PriceBook::load(&file.pricing);
+    for key in &rejected_rates {
+        tracing::warn!(
+            model = key.as_str(),
+            "ignoring [pricing] entry: rates must be finite, non-negative USD per 1M tokens"
+        );
+    }
+    if pricing.is_empty() {
+        tracing::info!(
+            "no [pricing.<model>] rates configured; recall_cost_saved_usd_total stays 0 and saved \
+             tokens are reported as unpriced"
+        );
+    } else {
+        tracing::info!(
+            models = pricing.len(),
+            "price book loaded; cache savings will also be reported in USD"
+        );
+    }
+
     let initial_policy = match build_policy(&policy_kind, tau, target_fhr) {
         Ok(p) => p,
         Err(e) => {
@@ -868,33 +1301,99 @@ fn cmd_serve(args: &[String]) -> i32 {
     } else {
         (initial_policy, None)
     };
-    // ANN index: `brute` (exact, default) or `hnsw` (approximate, sublinear at scale — recall@1 ≥
-    // 0.98 vs the brute-force oracle, PLAN.md §3-OSS T3). Both are pure-Rust, no extra deps.
+    // ANN index: `brute` (exact, default) or `hnsw` (approximate, sublinear at scale — PLAN.md
+    // §3-OSS T3). Both are pure-Rust, no extra deps.
     let index_kind = resolve("--index", "RECALL_INDEX", file.index, "brute");
+    // HNSW graph tunables (used only with --index hnsw): flag > env > file > validated default.
+    // These are THE recall-vs-latency dials at scale — `recall ann-bench --m/--ef-search` measures
+    // the trade for your dims/N before you commit a fleet to them.
+    let hnsw_defaults = recall_index::HnswConfig::default();
+    let hnsw_num = |flag_name: &str, env: &str, file_v: Option<usize>, default: usize| -> usize {
+        let raw = resolve(
+            flag_name,
+            env,
+            file_v.map(|v| v.to_string()),
+            &default.to_string(),
+        );
+        parse_or_warn(flag_name, &raw, default)
+    };
+    let hnsw_m = hnsw_num("--hnsw-m", "RECALL_HNSW_M", file.hnsw_m, hnsw_defaults.m);
+    let hnsw_efc = hnsw_num(
+        "--hnsw-ef-construction",
+        "RECALL_HNSW_EF_CONSTRUCTION",
+        file.hnsw_ef_construction,
+        hnsw_defaults.ef_construction,
+    );
+    let hnsw_efs = hnsw_num(
+        "--hnsw-ef-search",
+        "RECALL_HNSW_EF_SEARCH",
+        file.hnsw_ef_search,
+        hnsw_defaults.ef_search,
+    );
     let index: Box<dyn recall_core::AnnIndex> = match index_kind.as_str() {
         "brute" => Box::new(BruteForceIndex::new()),
         "hnsw" => {
             eprintln!(
-                "recall serve: HNSW index (approximate ANN, recall@1 ≥ 0.98 vs the brute-force oracle)"
+                "recall serve: HNSW index (approximate ANN; m={hnsw_m} ef_construction={hnsw_efc} \
+                 ef_search={hnsw_efs} — validate recall@1 for your dims/N with `recall ann-bench`)"
             );
-            Box::new(recall_index::HnswIndex::new())
+            Box::new(recall_index::HnswIndex::with_config(
+                recall_index::HnswConfig::with_params(hnsw_m, hnsw_efc, hnsw_efs),
+            ))
         }
         other => {
             eprintln!("recall serve: unknown --index '{other}' (expected: brute | hnsw)");
             return 2;
         }
     };
+    // §5.3 second-neighbour ambiguity gate (0 = off, the default): near-tied top-2 neighbours with
+    // different answers are served as misses instead of a coin-flip hit.
+    let ambiguity_eps: f32 = parse_or_warn(
+        "--ambiguity-eps",
+        &resolve(
+            "--ambiguity-eps",
+            "RECALL_AMBIGUITY_EPS",
+            file.ambiguity_eps.map(|v| v.to_string()),
+            "0",
+        ),
+        0.0,
+    );
+    if ambiguity_eps > 0.0 {
+        tracing::info!(
+            eps = ambiguity_eps,
+            "ambiguity gate armed — near-tied lookalikes with different answers will miss"
+        );
+    }
+    // Savings-ledger persistence. Off by default: `/metrics` and `recall.export/v1` both document
+    // the process as the boundary its cumulative counters reset at, so counters that outlive a
+    // restart are a change of meaning for every consumer and are never switched on unasked.
+    let savings_flush_secs: u64 = parse_or_warn(
+        "--savings-flush-secs",
+        &resolve(
+            "--savings-flush-secs",
+            "RECALL_SAVINGS_FLUSH_SECS",
+            file.savings_flush_secs.map(|v| v.to_string()),
+            "0",
+        ),
+        0,
+    );
 
     let embedder = build_embedder(model.as_deref());
     // Fail fast if an explicitly requested backend can't be honored, rather than silently
     // downgrading the durability/behavior the operator asked for.
-    let cache = match build_cache(embedder, index, &store_kind, &db_path, policy) {
-        Ok(cache) => Arc::new(cache),
+    let built = match build_cache(embedder, index, &store_kind, &db_path, policy) {
+        Ok(built) => built,
         Err(e) => {
             eprintln!("recall serve: {e}");
             return 2;
         }
     };
+    // The durable handle (if any) is taken before the cache is boxed, so the savings ledger can be
+    // persisted through the same database the entries live in.
+    #[cfg(feature = "store-redb")]
+    let ledger_store = built.ledger;
+    let store_facts = built.facts;
+    let cache = Arc::new(built.cache.with_ambiguity_eps(ambiguity_eps));
     let config = Config {
         listen: listen.clone(),
         upstream_base: upstream.clone(),
@@ -904,9 +1403,60 @@ fn cmd_serve(args: &[String]) -> i32 {
         anthropic_upstream_base: anthropic_upstream,
         anthropic_version,
         anthropic_api_key,
+        pricing,
+        store: store_facts,
         ..Config::default()
     };
     let state = ProxyState::new(cache, config);
+
+    // Savings-ledger persistence (durable store only, opt-in). Restore first — so the counters are
+    // already whole before the listener accepts anything — then keep flushing them. The handle and
+    // epoch are kept for the shutdown flush after `serve` returns.
+    #[cfg(feature = "store-redb")]
+    let mut ledger_at_shutdown = None;
+    #[cfg(feature = "store-redb")]
+    if savings_flush_secs > 0 {
+        match ledger_store {
+            Some(store) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // A restored epoch travels with the ledger; a fresh one starts now.
+                let since = restore_ledger(&store, &state).unwrap_or(now);
+                state
+                    .ledger_since_unix
+                    .store(since, std::sync::atomic::Ordering::Relaxed);
+                // Write immediately, so a node that restarts before the first tick still records
+                // its epoch (and an operator can see the ledger is live without waiting).
+                if let Err(e) = flush_ledger(&store, &state, since) {
+                    tracing::warn!(error = %e, "first savings ledger flush failed; will retry");
+                }
+                let flusher =
+                    spawn_ledger_flusher(state.clone(), store.clone(), since, savings_flush_secs);
+                ledger_at_shutdown = Some((store, since, flusher));
+                tracing::info!(
+                    every_secs = savings_flush_secs,
+                    since_unix = since,
+                    "savings ledger persistence active — counters now outlive this process"
+                );
+            }
+            None => tracing::warn!(
+                "--savings-flush-secs needs a durable store; ignoring it (counters reset with this process)"
+            ),
+        }
+    }
+
+    // Same knob on a build without the durable store: say so rather than accepting it silently,
+    // since an operator who asked for a persistent figure would otherwise get a resetting one and
+    // no indication why.
+    #[cfg(not(feature = "store-redb"))]
+    if savings_flush_secs > 0 {
+        tracing::warn!(
+            "--savings-flush-secs needs a `--features store-redb` build; ignoring it \
+             (counters reset with this process)"
+        );
+    }
 
     // Start the config watcher (if `--watch-config`): it swaps the threshold policy in place when the
     // file changes. `config_path` is guaranteed Some here (validated above).
@@ -946,13 +1496,31 @@ fn cmd_serve(args: &[String]) -> i32 {
         "recall serve: listening (cache-miss forwarding)"
     );
     // Propagate a bind/serve failure as a non-zero exit so a supervisor/script sees a dead proxy.
-    match rt.block_on(async move { recall_proxy::serve(state).await }) {
+    let code = match rt.block_on(async {
+        let state = state.clone();
+        recall_proxy::serve(state).await
+    }) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("recall serve: server error: {e}");
             1
         }
+    };
+    // Shutdown flush: `serve` returning is the one moment we know no more traffic is coming, so
+    // the last interval's counters are written rather than dropped. Without this a planned deploy
+    // loses up to `--savings-flush-secs` of savings — indistinguishable from a crash, for a figure
+    // whose whole purpose is to be quotable across deploys.
+    #[cfg(feature = "store-redb")]
+    if let Some((store, since, flusher)) = ledger_at_shutdown {
+        // Order matters: the periodic thread must be finished before this write, or its in-flight
+        // (older) snapshot could land after it and become the durable one.
+        flusher.stop_and_join();
+        match flush_ledger(&store, &state, since) {
+            Ok(hits) => tracing::info!(hits, "savings ledger flushed on shutdown"),
+            Err(e) => tracing::warn!(error = %e, "savings ledger shutdown flush failed"),
+        }
     }
+    code
 }
 
 /// Pick the embedder: the static model2vec backend if `--model`/`RECALL_MODEL2VEC_PATH` is set AND
@@ -984,25 +1552,173 @@ fn build_embedder(model_path: Option<&str>) -> Box<dyn Embedder> {
 /// (so `serve` exits non-zero) when an explicitly requested backend can't be honored — an unknown
 /// `--store`, or `redb` on a binary built without the `store-redb` feature, or a redb open failure —
 /// rather than silently downgrading to the in-memory store.
+/// A store opened at start-up, with what it recovered.
+///
+/// `build_cache` used to discard the rehydration numbers into a log line, which meant "did my cache
+/// survive the restart" could only be answered by whoever happened to be watching stderr at the
+/// time. They come back with the cache now, so `/metrics` can report them.
+/// Restore a persisted savings ledger into a freshly built node, returning the ledger's epoch (the
+/// value `recall_ledger_since_time_seconds` reports) — or `None` when there is nothing usable to
+/// restore, in which case the node starts a fresh ledger at `now`.
+///
+/// Every failure mode lands on "start fresh, with a warning": a first run on this volume, a
+/// snapshot written by a newer build, a corrupt blob, an unreadable database. Savings accounting
+/// must never be the reason a cache refuses to serve.
+#[cfg(feature = "store-redb")]
+fn restore_ledger(
+    store: &recall_store::RedbStore,
+    state: &std::sync::Arc<ProxyState>,
+) -> Option<u64> {
+    let blob = match store.load_savings_blob() {
+        Ok(Some(b)) => b,
+        Ok(None) => return None, // first run on this volume
+        Err(e) => {
+            tracing::warn!(error = %e, "savings ledger unreadable; starting a fresh ledger");
+            return None;
+        }
+    };
+    let snap: recall_proxy::ledger::LedgerSnapshot = match serde_json::from_slice(&blob) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "savings ledger snapshot is corrupt; starting a fresh ledger");
+            return None;
+        }
+    };
+    if !recall_proxy::ledger::restore(&snap, &state.metrics, &state.namespaces) {
+        tracing::warn!(
+            version = snap.version,
+            supported = recall_proxy::ledger::VERSION,
+            "savings ledger snapshot is a version this build does not know; starting a fresh ledger"
+        );
+        return None;
+    }
+    tracing::info!(
+        hits = snap.hits,
+        cost_saved_micros = snap.cost_saved_micros,
+        since_unix = snap.since_unix,
+        "savings ledger restored — the $ saved figure survives the restart"
+    );
+    Some(snap.since_unix)
+}
+
+/// Persist the ledger once. Shared by the periodic flusher and the flush-on-shutdown path, so both
+/// write exactly the same bytes.
+#[cfg(feature = "store-redb")]
+fn flush_ledger(
+    store: &recall_store::RedbStore,
+    state: &std::sync::Arc<ProxyState>,
+    since_unix: u64,
+) -> Result<u64, String> {
+    let snap = recall_proxy::ledger::snapshot(&state.metrics, &state.namespaces, since_unix);
+    let bytes = serde_json::to_vec(&snap).map_err(|e| e.to_string())?;
+    store.save_savings_blob(&bytes).map_err(|e| e.to_string())?;
+    Ok(snap.hits)
+}
+
+/// A running ledger flusher: drop or signal the sender to stop it, then join the handle to know it
+/// has finished writing.
+#[cfg(feature = "store-redb")]
+struct LedgerFlusher {
+    stop: std::sync::mpsc::Sender<()>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "store-redb")]
+impl LedgerFlusher {
+    /// Stop the flusher and wait for it to finish. **Must** be called before the shutdown flush:
+    /// otherwise the thread can snapshot older counters, the shutdown flush can commit newer ones,
+    /// and the thread's late write then makes the *older* snapshot the durable one — silently
+    /// undoing the very accounting the shutdown flush exists to save.
+    fn stop_and_join(self) {
+        // Either arm ends the wait: an explicit signal, or the sender dropping. Both mean "stop".
+        let _ = self.stop.send(());
+        if self.handle.join().is_err() {
+            tracing::warn!("savings ledger flusher panicked; its last write may not have landed");
+        }
+    }
+}
+
+/// Persist the ledger every `every_secs`, until told to stop.
+///
+/// A dedicated OS thread rather than a Tokio task: persistence is the one thing that must still
+/// happen when the reactor is saturated, and redb's write transaction is blocking anyway. A failed
+/// flush warns and retries on the next tick — the in-memory counters are still correct, so a
+/// transient write error costs at most one interval of durability, never the running figure.
+///
+/// The wait is a channel timeout rather than a sleep so shutdown is prompt: a `--savings-flush-secs
+/// 300` node still exits immediately instead of blocking five minutes on a sleeping thread.
+#[cfg(feature = "store-redb")]
+fn spawn_ledger_flusher(
+    state: std::sync::Arc<ProxyState>,
+    store: recall_store::RedbStore,
+    since_unix: u64,
+    every_secs: u64,
+) -> LedgerFlusher {
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let interval = std::time::Duration::from_secs(every_secs);
+        // Timing out means "another interval elapsed, flush". Anything else — a signal, or the
+        // sender dropped — means shutdown, and the caller's flush supersedes ours.
+        while matches!(
+            rx.recv_timeout(interval),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            match flush_ledger(&store, &state, since_unix) {
+                Ok(hits) => tracing::debug!(hits, "savings ledger flushed"),
+                Err(e) => tracing::warn!(error = %e, "savings ledger flush failed; will retry"),
+            }
+        }
+    });
+    LedgerFlusher { stop, handle }
+}
+
+struct BuiltCache {
+    cache: recall_core::DynCache,
+    facts: recall_proxy::config::StoreFacts,
+    /// A second handle on the durable store, kept OUTSIDE the boxed cache so the binary can also
+    /// persist the savings ledger through it. `None` for the in-memory store — and always `None`
+    /// on a build without the feature, which is what makes the ledger a redb-only capability.
+    #[cfg(feature = "store-redb")]
+    ledger: Option<recall_store::RedbStore>,
+}
+
 fn build_cache(
     embedder: Box<dyn Embedder>,
     index: Box<dyn recall_core::AnnIndex>,
     store_kind: &str,
     db_path: &str,
     policy: Box<dyn recall_core::ThresholdPolicy>,
-) -> Result<recall_core::DynCache, String> {
+) -> Result<BuiltCache, String> {
     match store_kind {
-        "memory" => Ok(recall_proxy::boxed_cache_full_with_index(
-            embedder,
-            index,
-            Box::new(MemKv::new()),
-            policy,
-        )),
+        "memory" => {
+            let cache = recall_proxy::boxed_cache_full_with_index(
+                embedder,
+                index,
+                Box::new(MemKv::new()),
+                policy,
+            );
+            // An ephemeral store starts empty by design, not by loss — say so once, so a zero
+            // hit-rate in the first minutes reads as expected rather than as a fault, and so the
+            // cost of refilling after each restart is a decision the operator makes knowingly.
+            tracing::info!(
+                "in-memory store — the cache starts empty and is not kept across a restart \
+                 (use --store redb --db-path … to keep it)"
+            );
+            Ok(BuiltCache {
+                cache,
+                facts: recall_proxy::config::StoreFacts::default(),
+                #[cfg(feature = "store-redb")]
+                ledger: None,
+            })
+        }
         "redb" => {
             #[cfg(feature = "store-redb")]
             {
                 let store = recall_store::RedbStore::open(db_path)
                     .map_err(|e| format!("--store redb: open {db_path} failed: {e}"))?;
+                // A cheap Arc clone of the same database: one handle lives inside the cache, the
+                // other carries the savings ledger.
+                let ledger = store.clone();
                 let cache = recall_proxy::boxed_cache_full_with_index(
                     embedder,
                     index,
@@ -1014,20 +1730,35 @@ fn build_cache(
                                                  // *lookups* — not just the KV entries — survive the restart. On failure we keep
                                                  // serving with a cold index (the blobs are intact; entries re-learn on first miss)
                                                  // rather than refusing to start.
-                match cache.rehydrate() {
-                    Ok(n) => tracing::info!(
-                        db_path,
-                        rehydrated = n,
-                        persisted,
-                        "durable redb store — rehydrated cached lookups across restart"
-                    ),
-                    Err(e) => tracing::warn!(
-                        db_path,
-                        error = %e,
-                        "durable redb store — rehydration failed; serving with a cold index (KV blobs intact)"
-                    ),
-                }
-                Ok(cache)
+                let rehydrated = match cache.rehydrate() {
+                    Ok(n) => {
+                        tracing::info!(
+                            db_path,
+                            rehydrated = n,
+                            persisted,
+                            "durable redb store — rehydrated cached lookups across restart"
+                        );
+                        n
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            db_path,
+                            error = %e,
+                            "durable redb store — rehydration failed; serving with a cold index (KV blobs intact)"
+                        );
+                        0
+                    }
+                };
+                Ok(BuiltCache {
+                    cache,
+                    facts: recall_proxy::config::StoreFacts {
+                        backend: "redb",
+                        durable: true,
+                        persisted_at_start: persisted as u64,
+                        rehydrated: rehydrated as u64,
+                    },
+                    ledger: Some(ledger),
+                })
             }
             #[cfg(not(feature = "store-redb"))]
             {
@@ -1092,6 +1823,20 @@ fn effective_policy(new: &FileConfig, pins: &ReloadPins) -> (String, f32, f64) {
     (kind, tau, fhr)
 }
 
+/// Parse a resolved config value, saying so when it cannot rather than falling back in silence.
+///
+/// A bare `.parse().unwrap_or(default)` reads to the operator as "you never asked for it": a
+/// typo'd `--ambiguity-eps 0.O5` leaves a false-hit guard disarmed and `--savings-flush-secs 60s`
+/// leaves the savings figure resetting every deploy, both without a word anywhere. The default
+/// still applies — a malformed knob must never stop the proxy serving — but it stops being
+/// invisible.
+fn parse_or_warn<T: std::str::FromStr>(setting: &str, raw: &str, default: T) -> T {
+    raw.parse().unwrap_or_else(|_| {
+        tracing::warn!(setting, value = raw, "unparseable value; using the default");
+        default
+    })
+}
+
 /// Non-policy config fields that changed vs the startup baseline — these are NOT hot-reloadable (they
 /// own bound sockets / loaded weights / file handles), so the watcher logs them and leaves them at
 /// their startup values. Pure — unit-tested.
@@ -1120,6 +1865,21 @@ fn ignored_nonpolicy_changes(new: &FileConfig, startup: &FileConfig) -> Vec<&'st
     }
     if new.max_temperature != startup.max_temperature {
         changed.push("max_temperature");
+    }
+    // The graph is built once and the gate is baked into the cache at construction, so these are
+    // startup-only too. Without them here, `--watch-config` would accept an edit in silence and
+    // leave the operator believing a live change took effect.
+    if new.hnsw_m != startup.hnsw_m
+        || new.hnsw_ef_construction != startup.hnsw_ef_construction
+        || new.hnsw_ef_search != startup.hnsw_ef_search
+    {
+        changed.push("hnsw_*");
+    }
+    if new.ambiguity_eps != startup.ambiguity_eps {
+        changed.push("ambiguity_eps");
+    }
+    if new.savings_flush_secs != startup.savings_flush_secs {
+        changed.push("savings_flush_secs");
     }
     changed
 }
@@ -1222,6 +1982,50 @@ mod tests {
     };
     use recall_proxy::PolicyHandle;
 
+    /// The `[pricing.<model>]` TOML shape, end to end: parsed off a real config snippet (not a
+    /// hand-built map), so a rename or a shape change in `FileConfig` fails here rather than
+    /// silently pricing nothing in production.
+    #[test]
+    fn pricing_table_parses_from_toml_and_loads() {
+        let toml = r#"
+tau = 0.9
+
+[pricing."gpt-4o"]
+input = 2.50
+output = 10.00
+
+[pricing."gpt-4o-mini*"]
+input = 0.15
+output = 0.60
+"#;
+        let fc: FileConfig = toml::from_str(toml).expect("config parses");
+        assert_eq!(fc.pricing.len(), 2);
+        let (book, rejected) = recall_proxy::pricing::PriceBook::load(&fc.pricing);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        // 1M input @ $2.50 + 1M output @ $10.00 = $12.50 → 12_500_000 micro-USD.
+        assert_eq!(
+            book.cost_micros("gpt-4o", 1_000_000, 1_000_000),
+            Some(12_500_000)
+        );
+        // The prefix rule reaches a dated snapshot the exact key would not.
+        assert_eq!(
+            book.cost_micros("gpt-4o-mini-2024-07-18", 1_000_000, 0),
+            Some(150_000)
+        );
+        // An unrelated model stays unpriced rather than being guessed at.
+        assert_eq!(book.cost_micros("claude-sonnet-4", 1_000, 1_000), None);
+    }
+
+    /// A config with no `[pricing]` section at all must still parse — the table is optional and an
+    /// empty price book is a supported state, not a startup failure.
+    #[test]
+    fn config_without_pricing_still_parses_to_an_empty_book() {
+        let fc: FileConfig = toml::from_str("tau = 0.9\n").expect("config parses");
+        assert!(recall_proxy::pricing::PriceBook::load(&fc.pricing)
+            .0
+            .is_empty());
+    }
+
     #[test]
     fn cosine_is_one_for_identical_and_zero_for_orthogonal() {
         let a = [1.0_f32, 2.0, 3.0];
@@ -1284,6 +2088,40 @@ mod tests {
         };
         let (kind, tau, fhr) = effective_policy(&file, &pins);
         assert_eq!((kind.as_str(), tau, fhr), ("static", 0.95, 0.01));
+    }
+
+    #[test]
+    fn startup_only_keys_are_flagged_as_needing_a_restart() {
+        // The graph knobs, the gate and the flush interval are all read once at startup. If they
+        // are missing from this list, `--watch-config` accepts an edit to them in silence and the
+        // operator is left believing a live change took effect.
+        let startup = FileConfig::default();
+        let edited = FileConfig {
+            hnsw_ef_search: Some(512),
+            ambiguity_eps: Some(0.02),
+            savings_flush_secs: Some(30),
+            ..Default::default()
+        };
+        let ignored = ignored_nonpolicy_changes(&edited, &startup);
+        for key in ["hnsw_*", "ambiguity_eps", "savings_flush_secs"] {
+            assert!(ignored.contains(&key), "{key} must warn; got {ignored:?}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_value_falls_back_without_taking_the_proxy_down() {
+        // The default still applies — a typo must never stop the proxy serving — and the operator
+        // gets a warning rather than silence (asserted by the caller's log, not here).
+        assert_eq!(
+            super::parse_or_warn("--ambiguity-eps", "0.O5", 0.0_f32),
+            0.0
+        );
+        assert_eq!(
+            super::parse_or_warn("--savings-flush-secs", "60s", 0_u64),
+            0
+        );
+        // A good value still parses.
+        assert_eq!(super::parse_or_warn("--hnsw-m", "64", 32_usize), 64);
     }
 
     #[test]

@@ -257,18 +257,6 @@ impl TokenUsage {
     }
 }
 
-/// Read a `usage.<key>` u64 from a response body, defaulting to 0 when absent/unparseable.
-fn usage_field(body: &str, key: &str) -> u64 {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("usage")
-                .and_then(|u| u.get(key))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0)
-}
-
 /// The JSON payloads of an SSE body's `data:` events, skipping blanks and the `[DONE]` sentinel.
 /// Used to recover usage from a *stored streamed* response, which is raw SSE rather than one JSON
 /// object.
@@ -279,65 +267,66 @@ fn sse_data_payloads(body: &str) -> impl Iterator<Item = &str> {
         .filter(|p| !p.is_empty() && *p != "[DONE]")
 }
 
-/// Extract `usage.total_tokens` from an OpenAI-shaped response body, for the tokens-saved metric.
-/// Handles both a non-streaming JSON object and a stored streamed (SSE) body — in the latter the
-/// usage chunk (present when the request set `stream_options.include_usage`) carries it; otherwise
-/// there is simply no usage to count.
-pub fn total_tokens(body: &str) -> u64 {
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        if let Some(t) = v
-            .get("usage")
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(Value::as_u64)
-        {
-            return t;
-        }
-    }
-    // Streamed: take the last usage chunk's total_tokens, if any.
-    let mut total = 0;
-    for payload in sse_data_payloads(body) {
-        if let Ok(v) = serde_json::from_str::<Value>(payload) {
-            if let Some(t) = v
-                .get("usage")
-                .and_then(|u| u.get("total_tokens"))
-                .and_then(Value::as_u64)
-            {
-                total = t;
-            }
-        }
-    }
-    total
+/// A `usage.<key>` u64 out of an already-parsed usage object, defaulting to 0.
+fn usage_u64(usage: &Value, key: &str) -> u64 {
+    usage.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// OpenAI input/output split: `usage.prompt_tokens` and `usage.completion_tokens`.
+///
+/// Handles **both** shapes a stored completion can take: one JSON object (non-streaming) and raw SSE
+/// (a stored streamed response). The SSE arm matters as much as the JSON one — a streamed hit is
+/// still a hit, and reading its usage as zero would silently zero the savings figure for every
+/// streaming deployment.
+///
+/// In an OpenAI stream the usage arrives on a single late chunk (present when the request set
+/// `stream_options: {"include_usage": true}`), so the last chunk carrying usage wins. A stream
+/// without that option has no usage to read at all and correctly yields zero — the caller
+/// distinguishes "no usage reported" from "nothing saved", this function does not.
 pub fn openai_usage(body: &str) -> TokenUsage {
-    TokenUsage {
-        input: usage_field(body, "prompt_tokens"),
-        output: usage_field(body, "completion_tokens"),
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(u) = v.get("usage") {
+            return TokenUsage {
+                input: usage_u64(u, "prompt_tokens"),
+                output: usage_u64(u, "completion_tokens"),
+            };
+        }
     }
+    let mut usage = TokenUsage::default();
+    for payload in sse_data_payloads(body) {
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(u) = v.get("usage") {
+                let chunk = TokenUsage {
+                    input: usage_u64(u, "prompt_tokens"),
+                    output: usage_u64(u, "completion_tokens"),
+                };
+                // A `"usage": null` chunk (OpenAI sends one per content delta under
+                // include_usage) must not wipe a real reading that already arrived.
+                if chunk != TokenUsage::default() {
+                    usage = chunk;
+                }
+            }
+        }
+    }
+    usage
 }
 
 /// Anthropic input/output split: `usage.input_tokens` and `usage.output_tokens`.
+///
+/// Handles both a non-streaming JSON object and a stored streamed (SSE) body. Anthropic splits its
+/// stream usage across events — `input_tokens` arrives once on `message_start` (nested under
+/// `message.usage`) while the cumulative `output_tokens` grows across `message_delta` events (usage
+/// top-level) — so each tier takes the maximum seen rather than the last, which is what makes the
+/// running total correct no matter which event the stream ended on.
 pub fn anthropic_usage(body: &str) -> TokenUsage {
-    TokenUsage {
-        input: usage_field(body, "input_tokens"),
-        output: usage_field(body, "output_tokens"),
-    }
-}
-
-/// Extract total tokens from an Anthropic-shaped response body. Anthropic reports `input_tokens` and
-/// `output_tokens` separately (no `total_tokens`), so the saved total is their sum. Handles both a
-/// non-streaming JSON object and a stored streamed (SSE) body, where `input_tokens` arrives on
-/// `message_start` (under `message.usage`) and the cumulative `output_tokens` on `message_delta`.
-pub fn anthropic_total_tokens(body: &str) -> u64 {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
-        let field = |u: &Value, k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
         if let Some(u) = v.get("usage") {
-            return field(u, "input_tokens").saturating_add(field(u, "output_tokens"));
+            return TokenUsage {
+                input: usage_u64(u, "input_tokens"),
+                output: usage_u64(u, "output_tokens"),
+            };
         }
     }
-    // Streamed: `input_tokens` is reported once; `output_tokens` grows across deltas — take the max
-    // of each (usage appears top-level on message_delta and under `message` on message_start).
     let (mut input, mut output) = (0u64, 0u64);
     for payload in sse_data_payloads(body) {
         let Ok(v) = serde_json::from_str::<Value>(payload) else {
@@ -350,15 +339,51 @@ pub fn anthropic_total_tokens(body: &str) -> u64 {
         .into_iter()
         .flatten()
         {
-            if let Some(i) = usage.get("input_tokens").and_then(Value::as_u64) {
-                input = input.max(i);
-            }
-            if let Some(o) = usage.get("output_tokens").and_then(Value::as_u64) {
-                output = output.max(o);
+            input = input.max(usage_u64(usage, "input_tokens"));
+            output = output.max(usage_u64(usage, "output_tokens"));
+        }
+    }
+    TokenUsage { input, output }
+}
+
+/// Total tokens in an OpenAI-shaped body (JSON or stored SSE), for callers that do not need the
+/// price-tier split.
+///
+/// The provider's own `usage.total_tokens` wins wherever the body states one — a body may report a
+/// total without the prompt/completion split, and summing a split that is not there would read as
+/// zero. Only when no total is stated does this fall back to summing [`openai_usage`].
+pub fn total_tokens(body: &str) -> u64 {
+    let stated = |v: &Value| {
+        v.get("usage")
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(Value::as_u64)
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(t) = stated(&v) {
+            return t;
+        }
+    }
+    // Streamed: the last chunk stating a total wins, matching openai_usage's last-chunk rule.
+    let mut total = 0;
+    for payload in sse_data_payloads(body) {
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(t) = stated(&v) {
+                total = t;
             }
         }
     }
-    input.saturating_add(output)
+    if total > 0 {
+        return total;
+    }
+    openai_usage(body).total()
+}
+
+/// Total tokens in an Anthropic-shaped body (JSON or stored SSE), for callers that do not need the
+/// price-tier split. Anthropic reports `input_tokens`/`output_tokens` separately with no
+/// `total_tokens`, so the total is simply their sum — see [`anthropic_usage`] for how each tier is
+/// recovered from the two events that carry it.
+pub fn anthropic_total_tokens(body: &str) -> u64 {
+    anthropic_usage(body).total()
 }
 
 /// True iff a captured OpenAI SSE stream completed *cleanly* and is therefore safe to cache
@@ -554,6 +579,60 @@ mod tests {
     fn total_tokens_extracted() {
         assert_eq!(total_tokens(r#"{"usage":{"total_tokens":42}}"#), 42);
         assert_eq!(total_tokens(r#"{"no":"usage"}"#), 0);
+    }
+
+    #[test]
+    fn usage_split_recovered_from_a_stored_openai_stream() {
+        // A stored streamed response is raw SSE, not one JSON object. Reading it as JSON yields
+        // nothing, which would zero the savings figure for every streaming deployment.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":2000,\"total_tokens\":3000}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(
+            openai_usage(sse),
+            TokenUsage {
+                input: 1000,
+                output: 2000
+            }
+        );
+        // The per-delta `"usage": null` chunks must not wipe the real reading.
+        assert_eq!(total_tokens(sse), 3000);
+        // The non-streaming shape still works unchanged.
+        assert_eq!(
+            openai_usage(r#"{"usage":{"prompt_tokens":4,"completion_tokens":7}}"#),
+            TokenUsage {
+                input: 4,
+                output: 7
+            }
+        );
+        // A stream with no usage at all reports zero — "not reported", which the caller flags.
+        let none = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(openai_usage(none), TokenUsage::default());
+    }
+
+    #[test]
+    fn usage_split_recovered_from_a_stored_anthropic_stream() {
+        // Anthropic splits usage across events: input_tokens once on message_start (nested under
+        // `message`), cumulative output_tokens across message_delta events (top-level).
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1200}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2000}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        // Max per tier, not last: input survives the later events that omit it, and the cumulative
+        // output takes its highest reading regardless of which event the stream ended on.
+        assert_eq!(
+            anthropic_usage(sse),
+            TokenUsage {
+                input: 1000,
+                output: 2000
+            }
+        );
+        assert_eq!(anthropic_total_tokens(sse), 3000);
     }
 
     #[test]

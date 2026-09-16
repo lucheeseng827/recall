@@ -7,6 +7,7 @@
 //! shared across all proxy workers.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use recall_core::{Entry, Key, RecallError, Store};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -14,9 +15,17 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 /// `Key (32 bytes) → serde_json(Entry)`.
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("recall.entries");
 
-/// A `Store` whose entries survive a process restart. Open once and share.
+/// A single-row table holding the savings-ledger snapshot as an opaque blob (the codec belongs to
+/// the caller — this store persists bytes, it does not interpret the ledger).
+const SAVINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("recall.savings");
+const SAVINGS_ROW: &str = "snapshot";
+
+/// A `Store` whose entries survive a process restart. Open once and share — `Clone` is a cheap
+/// `Arc` bump, so one handle can live inside the cache (as `Box<dyn Store>`) while another feeds
+/// the savings-ledger flusher.
+#[derive(Clone)]
 pub struct RedbStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 /// Wrap any redb / serde error into the seam's opaque backend error — `recall-core` never takes a
@@ -26,15 +35,40 @@ fn backend<E: std::fmt::Display>(e: E) -> RecallError {
 }
 
 impl RedbStore {
-    /// Open the database at `path`, creating it (and the entries table) if absent. Creating the
-    /// table up front means the first `get` on a brand-new database returns `None` rather than a
+    /// Open the database at `path`, creating it (and both tables) if absent. Creating the tables
+    /// up front means the first read on a brand-new database returns `None` rather than a
     /// "no such table" error.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RecallError> {
         let db = Database::create(path).map_err(backend)?;
         let wtxn = db.begin_write().map_err(backend)?;
         wtxn.open_table(ENTRIES).map_err(backend)?;
+        wtxn.open_table(SAVINGS).map_err(backend)?;
         wtxn.commit().map_err(backend)?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Persist the savings-ledger snapshot blob (one committed transaction; the previous snapshot
+    /// is atomically replaced — a crash leaves either the old or the new blob, never a torn one).
+    pub fn save_savings_blob(&self, bytes: &[u8]) -> Result<(), RecallError> {
+        let wtxn = self.db.begin_write().map_err(backend)?;
+        {
+            let mut table = wtxn.open_table(SAVINGS).map_err(backend)?;
+            table.insert(SAVINGS_ROW, bytes).map_err(backend)?;
+        }
+        wtxn.commit().map_err(backend)?;
+        Ok(())
+    }
+
+    /// Read back the persisted savings-ledger snapshot blob, if one was ever saved. A database
+    /// created before the savings table existed reports `None` (open() creates the empty table),
+    /// so an upgraded binary starts a fresh ledger rather than erroring.
+    pub fn load_savings_blob(&self) -> Result<Option<Vec<u8>>, RecallError> {
+        let rtxn = self.db.begin_read().map_err(backend)?;
+        let table = rtxn.open_table(SAVINGS).map_err(backend)?;
+        Ok(table
+            .get(SAVINGS_ROW)
+            .map_err(backend)?
+            .map(|guard| guard.value().to_vec()))
     }
 }
 
@@ -185,6 +219,68 @@ mod tests {
         assert_eq!(scanned[0].1.completion, "first");
         assert_eq!(scanned[1].1.completion, "second");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The savings ledger blob: saved, atomically replaced, and read back across a reopen — the
+    // persistence primitive behind "the $ saved figure survives a deploy". The store deliberately
+    // knows nothing about the ledger's shape: it persists opaque bytes, and the codec belongs to
+    // whoever owns the counters (recall-proxy), which is why this test asserts on bytes.
+    #[test]
+    fn savings_blob_replaces_and_survives_reopen() {
+        let path = temp_db("savings-blob");
+        {
+            let store = RedbStore::open(&path).unwrap();
+            assert!(
+                store.load_savings_blob().unwrap().is_none(),
+                "a fresh database has no snapshot"
+            );
+            store
+                .save_savings_blob(br#"{"version":1,"hits":1}"#)
+                .unwrap();
+            // A second save REPLACES the first (single-row semantics) — the ledger is a current
+            // value, not an append-only log, so a reopen must never see a stale generation.
+            store
+                .save_savings_blob(br#"{"version":1,"hits":2}"#)
+                .unwrap();
+        } // drop closes the database (simulating a restart)
+
+        let store = RedbStore::open(&path).unwrap(); // reopen
+        let blob = store
+            .load_savings_blob()
+            .unwrap()
+            .expect("snapshot survives the reopen");
+        assert_eq!(
+            blob,
+            br#"{"version":1,"hits":2}"#.to_vec(),
+            "the LATEST snapshot is the one that persisted"
+        );
+
+        // Arbitrary bytes round-trip: the store must not assume UTF-8 or any structure.
+        store.save_savings_blob(&[0xffu8, 0x00, 0x7f]).unwrap();
+        assert_eq!(
+            store.load_savings_blob().unwrap().unwrap(),
+            vec![0xffu8, 0x00, 0x7f]
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Clone shares the same underlying database: a blob saved through one handle is visible
+    // through the other — the shape serve uses (one handle in the cache, one in the flusher).
+    #[test]
+    fn cloned_handle_shares_the_database() {
+        let path = temp_db("clone-shared");
+        let a = RedbStore::open(&path).unwrap();
+        let b = a.clone();
+        b.save_savings_blob(b"ledger-bytes").unwrap();
+        assert_eq!(
+            a.load_savings_blob().unwrap().as_deref(),
+            Some(b"ledger-bytes".as_ref()),
+            "both handles see the same table"
+        );
+        a.put(Key::derive("ns", "p"), &entry("x")).unwrap();
+        assert_eq!(b.len(), 1);
         std::fs::remove_file(&path).ok();
     }
 

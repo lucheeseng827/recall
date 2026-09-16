@@ -4,6 +4,7 @@
 //! network-free and air-gap clean (PLAN.md §2.2, §2.3).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use crate::embed::Embedder;
@@ -34,6 +35,15 @@ where
     /// When true, a neighbor above τ is only served if its stored prompt equals the query exactly —
     /// an optional guard against obvious false hits. Off by default in the MVP; the seam exists.
     verify_on_hit: bool,
+    /// The §5.3 second-neighbor ambiguity gate: when `Some(eps)`, a would-be hit whose top and
+    /// second neighbors sit within `eps` similarity of each other AND carry *different* answers is
+    /// served as a miss — near-equidistant lookalikes with disagreeing completions are exactly
+    /// where false hits live. Two near-duplicates with the SAME answer replay safely regardless of
+    /// margin. `None` = off (default).
+    ambiguity_eps: Option<f32>,
+    /// Would-be hits the ambiguity gate demoted to misses (observability: lost hit-rate is lost
+    /// savings, so the demotions must be countable).
+    ambiguity_misses: AtomicU64,
 }
 
 impl<E, I, S, P> SemanticCache<E, I, S, P>
@@ -52,6 +62,8 @@ where
             exact: RwLock::new(HashMap::new()),
             top_k: 5,
             verify_on_hit: false,
+            ambiguity_eps: None,
+            ambiguity_misses: AtomicU64::new(0),
         }
     }
 
@@ -65,6 +77,14 @@ where
     /// Builder knob: enable the exact-equality verify-on-hit guard.
     pub fn with_verify_on_hit(mut self, on: bool) -> Self {
         self.verify_on_hit = on;
+        self
+    }
+
+    /// Builder knob: the §5.3 second-neighbor ambiguity gate. `eps > 0` arms it — a would-be hit
+    /// whose top-two neighbors are within `eps` similarity but disagree on the answer is demoted to
+    /// a miss. `eps <= 0` or non-finite disarms it (the safe default: behavior unchanged).
+    pub fn with_ambiguity_eps(mut self, eps: f32) -> Self {
+        self.ambiguity_eps = (eps.is_finite() && eps > 0.0).then_some(eps);
         self
     }
 
@@ -106,6 +126,21 @@ where
                 match self.kv.get(key)? {
                     // Serve unless verify-on-hit is on and the stored prompt differs.
                     Some(entry) if !self.verify_on_hit || entry.prompt == prompt => {
+                        // §5.3 gate 3 — second-neighbor ambiguity: if the runner-up is within
+                        // `eps` similarity of the winner but stores a DIFFERENT answer, the query
+                        // sits between two lookalikes and serving either is a coin flip — miss
+                        // instead. Same-answer near-duplicates (paraphrases of one completion)
+                        // replay safely regardless of margin. Runs only on the would-serve path,
+                        // so the common case costs one comparison; the second entry is fetched
+                        // only when the margin is actually ambiguous.
+                        if let (Some(eps), Some(second)) = (self.ambiguity_eps, hits.get(1)) {
+                            if score - second.score < eps
+                                && !self.second_has_same_answer(second.key, &entry)
+                            {
+                                self.ambiguity_misses.fetch_add(1, Ordering::Relaxed);
+                                return Ok(Lookup::Miss { vector });
+                            }
+                        }
                         Ok(Lookup::Hit { key, score, entry })
                     }
                     // index/kv drift or verify rejected → miss; the query vector is reused by put().
@@ -114,6 +149,21 @@ where
             }
             (Verdict::Hit, None) | (Verdict::Miss, _) => Ok(Lookup::Miss { vector }),
         }
+    }
+
+    /// Whether the second-ranked neighbor stores the same completion as the winning entry. A
+    /// missing or unreadable second entry (index/kv drift) answers `false` — the gate then misses
+    /// conservatively rather than serving through an ambiguity it cannot check.
+    fn second_has_same_answer(&self, second_key: Key, top_entry: &Entry) -> bool {
+        matches!(
+            self.kv.get(second_key),
+            Ok(Some(second_entry)) if second_entry.completion == top_entry.completion
+        )
+    }
+
+    /// How many would-be hits the §5.3 ambiguity gate demoted to misses (0 when the gate is off).
+    pub fn ambiguity_misses(&self) -> u64 {
+        self.ambiguity_misses.load(Ordering::Relaxed)
     }
 
     /// THE write path: store the fresh completion, then index it (store-BEFORE-index so a concurrent
@@ -535,5 +585,105 @@ mod tests {
             (expected_nsk, 0.8125, Outcome::Wrong),
             "forwarded under the ns_key, with the score and outcome intact"
         );
+    }
+
+    // ----- §5.3 second-neighbor ambiguity gate -----
+    // Two stored lookalikes rank as the query's top-2. With the gate armed at a wide eps, a
+    // disagreement between their answers demotes the hit to a miss; agreement (or a disarmed
+    // gate, or a wide margin) serves normally.
+
+    /// A cache with τ=0 (every top neighbor passes the threshold), isolating the gate.
+    fn gated(eps: f32) -> SemanticCache<HashEmbedder, BruteForceIndex, MemKv, StaticThreshold> {
+        cache(0.0, false).with_ambiguity_eps(eps)
+    }
+
+    #[test]
+    fn ambiguity_gate_demotes_near_tie_with_different_answers() {
+        // Both stored prompts are near the query; eps=1.0 makes any top-2 gap "ambiguous".
+        let c = gated(1.0);
+        c.put_embedding(&ns(), "alpha beta gamma one", "ANSWER-X")
+            .unwrap();
+        c.put_embedding(&ns(), "alpha beta gamma two", "ANSWER-Y")
+            .unwrap();
+
+        assert!(
+            matches!(
+                c.get(&ns(), "alpha beta gamma").unwrap(),
+                Lookup::Miss { .. }
+            ),
+            "near-tied neighbors with different answers must miss"
+        );
+        assert_eq!(c.ambiguity_misses(), 1, "the demotion is counted");
+    }
+
+    #[test]
+    fn ambiguity_gate_serves_near_tie_with_same_answer() {
+        let c = gated(1.0);
+        c.put_embedding(&ns(), "alpha beta gamma one", "SAME-ANSWER")
+            .unwrap();
+        c.put_embedding(&ns(), "alpha beta gamma two", "SAME-ANSWER")
+            .unwrap();
+
+        match c.get(&ns(), "alpha beta gamma").unwrap() {
+            Lookup::Hit { entry, .. } => assert_eq!(entry.completion, "SAME-ANSWER"),
+            Lookup::Miss { .. } => panic!("same-answer near-duplicates replay safely"),
+        }
+        assert_eq!(c.ambiguity_misses(), 0);
+    }
+
+    #[test]
+    fn ambiguity_gate_off_or_wide_margin_serves_normally() {
+        // Gate disarmed (eps=0): the different-answer near-tie from the demotion test serves.
+        let off = gated(0.0);
+        off.put_embedding(&ns(), "alpha beta gamma one", "ANSWER-X")
+            .unwrap();
+        off.put_embedding(&ns(), "alpha beta gamma two", "ANSWER-Y")
+            .unwrap();
+        assert!(
+            matches!(
+                off.get(&ns(), "alpha beta gamma").unwrap(),
+                Lookup::Hit { .. }
+            ),
+            "eps<=0 disarms the gate"
+        );
+
+        // Gate armed but the margin is wide: the runner-up is unrelated text, far below the
+        // winner, so a tiny eps never fires even though the answers differ.
+        let wide = gated(1e-6);
+        wide.put_embedding(&ns(), "alpha beta gamma delta", "ANSWER-X")
+            .unwrap();
+        wide.put_embedding(&ns(), "zzz completely unrelated words", "ANSWER-Y")
+            .unwrap();
+        assert!(
+            matches!(
+                wide.get(&ns(), "alpha beta gamma").unwrap(),
+                Lookup::Hit { .. }
+            ),
+            "a clear winner is served — the gate only bites near-ties"
+        );
+        assert_eq!(wide.ambiguity_misses(), 0);
+    }
+
+    #[test]
+    fn ambiguity_gate_never_touches_the_exact_shortcut() {
+        // An exact-prompt repeat is a certain hit (score 1.0) served before the ANN path — the
+        // gate must not interfere even at maximum eps with a conflicting second entry stored.
+        let c = gated(1.0);
+        let q = "what is the capital of france";
+        c.put_embedding(&ns(), q, "Paris.").unwrap();
+        c.put_embedding(
+            &ns(),
+            "what is the capital of france?",
+            "Lyon (wrong on purpose)",
+        )
+        .unwrap();
+        match c.get(&ns(), q).unwrap() {
+            Lookup::Hit { score, entry, .. } => {
+                assert_eq!(score, 1.0, "exact shortcut");
+                assert_eq!(entry.completion, "Paris.");
+            }
+            Lookup::Miss { .. } => panic!("exact repeat must hit regardless of the gate"),
+        }
+        assert_eq!(c.ambiguity_misses(), 0);
     }
 }

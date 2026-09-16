@@ -1,3 +1,5 @@
+<img src="docs/images/recall-logo.svg" alt="" width="72">
+
 # recall — self-hosted, Rust-native semantic cache
 
 `recall` is a semantic cache that sits in front of any OpenAI- or Anthropic-compatible LLM proxy and
@@ -40,6 +42,12 @@ four things it needs — turn text into a vector, find near vectors, persist ent
 store, the HNSW index, the adaptive threshold) plugs into those four seams.
 
 ### System context (high level)
+
+[![recall system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below, with the four seams named on the cache itself.
+Source: [`docs/images/architecture-system-context.html`](docs/images/architecture-system-context.html).
+The same topology as Mermaid, for diffing and for editing the drawing from:</sub>
 
 ```mermaid
 flowchart LR
@@ -246,6 +254,44 @@ the same affinity so the adaptive threshold trains on the instance that served t
   split with `cargo bench -p recall-core` (criterion hot-path) and the flat-vs-HNSW crossover with
   `cargo bench -p recall-index`.
 
+## "Isn't this what provider prompt caching does?"
+
+No, and the difference is worth two minutes because it decides whether recall is
+useful to you at all.
+
+**Provider prompt/prefix caching discounts the tokens of a call you still make.** You
+send the request, the provider recognises a prefix it has seen, and the shared part of
+the input is charged at a reduced rate. The call happens. You wait for it. A fresh
+answer is generated for the part that differs.
+
+**recall decides not to make the call.** On a hit there is no upstream request at all:
+no input tokens, no output tokens, no generation latency, no dependency on the provider
+being reachable. That is why a hit measures in microseconds rather than in the hundreds
+of milliseconds a discounted call still costs.
+
+The two solve different halves and **stack cleanly**:
+
+| | prefix caching | recall |
+|---|---|---|
+| when it helps | a long shared prefix, a *new* question after it | the same question, asked again in different words |
+| the call | still made | not made |
+| latency on the good path | full generation | ~113 µs p50, in-process |
+| works offline / air-gapped | no | yes, on a hit |
+| what it cannot do | answer a repeat for free | discount a genuinely novel prompt |
+
+So the honest scope: **recall does nothing for a unique prompt that needs a real
+answer.** If your traffic is mostly novel one-shot requests over a long shared context,
+prefix caching is your mechanism and recall will show you a low hit rate — which is the
+correct outcome, and you should find that out before installing anything. If your
+traffic is semantically repetitive — FAQ-shaped questions, RAG queries over a fixed
+corpus, agent loops re-asking near-identical prompts — the repeats are calls you are
+paying full price for today and prefix caching will not stop.
+
+**Measure it rather than believe it.** `recall replay --savings` runs against your own
+request log, with no key and no egress, and reports the hit rate you would actually get.
+Run it before you install — see [Measure it on your own traffic
+first](#measure-it-on-your-own-traffic-first).
+
 ## Quick start
 
 > New here? **[docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md)** is the 10-minute
@@ -303,7 +349,7 @@ export RECALL_UPSTREAM_API_KEY=sk-...           # OpenAI key — env only, never
 export RECALL_ANTHROPIC_API_KEY=sk-ant-...      # Anthropic key — env only, never a flag
 cargo run -p recall -- serve --config recall.toml
 #   GET  /healthz                 → "ok"
-#   GET  /metrics                 → Prometheus (hit-rate, tokens saved, …)
+#   GET  /metrics                 → Prometheus (hit-rate, tokens saved, $ saved, …)
 #   POST /v1/chat/completions     → OpenAI: hit replays the stored reply; miss forwards upstream & stores
 #   POST /v1/messages             → Anthropic Messages: same hit/miss/store, Anthropic-correct keying & auth
 #   POST /v1/cache/{lookup,insert}→ raw sidecar for non-OpenAI/Anthropic callers
@@ -345,6 +391,87 @@ and `score` from `/v1/cache/lookup`; OpenAI/Anthropic proxy callers get them fro
 and `x-recall-score` headers on the hit response (no key reconstruction needed). Absent any feedback it
 rests at the cold-start τ, so it is safe to enable and behaves like the static cutoff until it learns.
 Config precedence is **flag > env (`RECALL_*`) > `--config` file > default**.
+
+### Measure it on your own traffic first
+
+Before putting recall in your request path, point `recall replay` at a log of requests you already
+send — it reports what that log would have saved, against a throwaway proxy:
+
+```bash
+recall serve --config recall.toml &        # with your [pricing.<model>] rates, see below
+recall replay --file traffic.jsonl --target http://127.0.0.1:8080
+```
+
+```text
+recall replay  (target: http://127.0.0.1:8080, 200 lines)
+  $ saved         : $0.0392   (priced per model by the target's [pricing] table)
+                    not discounted for wrong hits — add --verify-sample to measure them
+  hit-rate        : 98.0%  (196 of 200 cacheable)
+  tokens saved    : 5684 total  (input 2352, output 3332)
+  requests        : 200  (hits 196, misses 4, bypass 0, errors 0)
+```
+
+The log is JSONL, one request body per line — the same bodies you send your provider. A first pass
+is the honest cold-start number (each distinct question misses once, filling the cache); replaying
+again reports the warm one, and each run reports only itself. Add `--verify-sample 0.1 --upstream
+<url>` to re-ask the upstream for a sample of hits and get the savings **both** gross and net of
+the measured disagreement rate — a wrong hit is not a saving. Full walkthrough in
+[`docs/GETTING_STARTED.md`](./docs/GETTING_STARTED.md#4-measure-it-on-your-own-traffic--before-you-commit).
+
+### Check in on a running proxy
+
+```bash
+recall status                    # --target http://host:port for a remote one; --json to pipe it
+```
+
+```text
+recall status  (target: http://127.0.0.1:8095)
+  $ saved         : $0.0394
+                    $0.0381 less the 3.3% observed false-hit rate
+  hit-rate        : 98.0%  (197 of 201 cacheable)
+  tokens saved    : 5713 total  (input 2364, output 3349)
+  entries         : 4 held by the store
+  requests        : 201  (hits 197, misses 4, bypass 0, upstream errors 0)
+  false-hit       : 3.3% observed  (2 of 60 judged hits reported wrong)
+```
+
+Everything it prints is measured, never assumed. Savings are discounted by the **observed**
+false-hit rate — the share of hits someone actually reported wrong via `/v1/cache/feedback` — and
+labelled un-discounted when no outcomes have been reported, because no feedback is not a 0% error
+rate. Under-counts get their own lines rather than being folded away: tokens saved on an unpriced
+model, hits whose stored completion carried no usage, and streamed misses that were dropped. A rate
+with no denominator abstains instead of printing `0.0%`.
+
+To feed your own tooling instead, `recall export` emits the same facts as one **versioned JSON
+document** (`recall.export/v1`, additive-only evolution, integer micro-USD, content-derived
+`export_id` for idempotent ingestion) — see [`docs/API.md`](./docs/API.md#export-format-recall-export--recallexportv1).
+
+### Report the savings in dollars
+
+`/metrics` always reports `recall_tokens_saved_total` — the tokens a hit meant you did not buy. Add
+your own rates to `recall.toml` and it also reports `recall_cost_saved_usd_total`:
+
+```toml
+[pricing."gpt-4o"]
+input = 2.50      # USD per 1M input (prompt) tokens
+output = 10.00    # USD per 1M output (completion) tokens
+
+[pricing."gpt-4o-mini*"]   # a trailing * is a prefix rule (covers dated snapshots)
+input = 0.15
+output = 0.60
+```
+
+Input and output are priced separately (output usually costs 3–5× input, so pricing the lumped
+total mis-states a skewed workload), and the accumulation is integer micro-USD, so millions of hits
+do not drift.
+
+There is **no bundled price list and no network lookup** — vendor prices change, differ by contract,
+and would rot in the binary, so the only numbers recall prices with are the ones you supply. The
+table is optional: with none configured the dollar figure stays `0` and `serve` says so at startup.
+A model with no matching rule is never guessed at — it contributes `$0` and its tokens are counted
+in `recall_unpriced_tokens_saved_total`, so an incomplete table reads as *unpriced* rather than as
+*the cache saved nothing*. `recall replay` (above) reports the same per-model figure for a request
+log; its flat `--price-input` / `--price-output` flags are a fallback for a proxy with no table.
 
 ## Use it as a library
 

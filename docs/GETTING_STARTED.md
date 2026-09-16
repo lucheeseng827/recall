@@ -174,7 +174,123 @@ x-recall-cache: hit
 time_total: 0.001959s
 ```
 
-## 4. Where to go next
+## 4. Measure it on your own traffic — before you commit
+
+Everything above proves the loop works. It does not tell you what recall is worth
+*to you* — that depends entirely on how repetitive your traffic actually is.
+`recall replay` answers that from a log of requests you already have, with nothing
+in your production request path.
+
+Give it a JSONL file, one request body per line — the same bodies you send your
+provider today:
+
+```text
+{"model":"mock-gpt","temperature":0,"messages":[{"role":"user","content":"How do I reset my password?"}]}
+{"model":"mock-gpt","temperature":0,"messages":[{"role":"user","content":"What is your refund policy?"}]}
+...
+```
+
+(Lines may also be `{"path":"/v1/messages","body":{…}}` to mix Anthropic traffic into
+the same file.)
+
+To get dollars rather than tokens, give the proxy your rates — see
+[`[pricing.<model>]`](./CONFIG.md#pricingmodel--report-savings-in-dollars). Copy them
+off a provider invoice; recall ships no price list and never looks one up:
+
+```toml
+# recall.toml
+listen = "127.0.0.1:8080"
+upstream = "http://127.0.0.1:9099"
+
+[pricing."mock-gpt"]
+input = 2.50      # USD per 1M input (prompt) tokens
+output = 10.00    # USD per 1M output (completion) tokens
+```
+
+Start the proxy with that config, then replay the log at it:
+
+```bash
+./target/debug/recall serve --config recall.toml &
+./target/debug/recall replay --file traffic.jsonl --target http://127.0.0.1:8080
+```
+
+```text
+recall replay  (target: http://127.0.0.1:8080, 200 lines)
+  $ saved         : $0.0392   (priced per model by the target's [pricing] table)
+                    not discounted for wrong hits — add --verify-sample to measure them
+  hit-rate        : 98.0%  (196 of 200 cacheable)
+  tokens saved    : 5684 total  (input 2352, output 3332)
+  requests        : 200  (hits 196, misses 4, bypass 0, errors 0)
+```
+
+> **Replaying against the mock upstream?** Make it keep-alive-capable first, or you
+> will see spurious `errors` where the connection was dropped between requests: add
+> `protocol_version = "HTTP/1.1"` to the `Handler` class and swap `HTTPServer` for
+> `ThreadingHTTPServer` (imported from the same module). One `curl` at a time does
+> not need this; 200 pooled requests do. A real upstream already handles it.
+
+Reading it:
+
+- **`$ saved`** is priced **per model**, by the proxy, from your table — a log spanning
+  several models is priced with each model's own rates, and the input/output split is
+  respected (output typically costs 3–5× input). With no table configured the line
+  says so instead of printing `$0.00`; `--price-input`/`--price-output` give a flat
+  blended estimate as a fallback.
+- **The hit-rate is the honest one for a cold start.** The first request for each
+  distinct question misses and fills the cache — 4 misses above, one per distinct
+  question — exactly as a fresh deployment would behave. Replaying the same log a
+  second time reports the *warm* number; both are real, they answer different
+  questions. Each run reports only itself, so a second replay is not the first one
+  counted twice.
+- **`$ saved` is not discounted for wrong hits** unless you measure them. Add
+  `--verify-sample 0.1 --upstream <url>` and recall re-asks the upstream for 10% of
+  its hits, compares the answers, and prints the savings **both** gross and net of
+  the measured disagreement rate. Only meaningful at `temperature: 0` — a sampled
+  model disagrees with itself. A wrong hit is not a saving, so quote the discounted
+  number to anyone who will hold you to it.
+
+If the hit-rate here is low, your traffic is not repetitive enough for a semantic
+cache to pay — and you found that out from a log, in a few minutes, without a
+deployment.
+
+## 5. Check in on it: `recall status`
+
+Once it is running, one command summarizes what the cache has actually done —
+the screen to paste into a thread when someone asks whether it is worth keeping:
+
+```bash
+./target/debug/recall status            # --target http://host:port for a remote one
+```
+
+```text
+recall status  (target: http://127.0.0.1:8095)
+  $ saved         : $0.0394
+                    $0.0381 less the 3.3% observed false-hit rate
+  hit-rate        : 98.0%  (197 of 201 cacheable)
+  tokens saved    : 5713 total  (input 2364, output 3349)
+  entries         : 4 held by the store
+  requests        : 201  (hits 197, misses 4, bypass 0, upstream errors 0)
+  false-hit       : 3.3% observed  (2 of 60 judged hits reported wrong)
+```
+
+The second line is the one that matters when you quote this to anyone. recall
+discounts the savings by the **observed** false-hit rate — the share of served hits
+someone actually reported wrong through
+[`POST /v1/cache/feedback`](./API.md#post-v1cachefeedback--train-the-adaptive-threshold). Report outcomes and you
+get a number you can defend; report none and the line says plainly that the figure
+is **not** discounted, because nobody looking is not the same as nobody finding
+anything.
+
+It also refuses to round its caveats away. Saved tokens on a model with no price
+rule, hits whose stored completion carried no usage at all, and streamed misses
+that were dropped rather than cached each get their own line when they occur — all
+three make the headline figure an **under-count**, and a number that is quietly too
+low costs trust as fast as one that is too high. A clean deployment prints no
+caveats at all, so seeing one always means something.
+
+`--json` emits the raw snapshot instead, for your own tooling.
+
+## 6. Where to go next
 
 - **Every flag / env / TOML key**: [CONFIG.md](./CONFIG.md) — including
   `--policy adaptive --target-fhr 0.02` (a learned, per-namespace threshold instead
@@ -189,3 +305,4 @@ time_total: 0.001959s
   [README](../README.md#use-it-as-a-library).
 - **Reproduce the numbers**: `cargo run -p recall-eval` (threshold-policy comparison)
   and `cargo bench --workspace` (criterion hot-path + index crossover).
+- **Every `replay` flag**: [CONFIG.md](./CONFIG.md#recall-replay--drive-a-running-serve-with-a-request-log).

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System context — one binary wrapping one cache</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f4f2ee;   /* bone */
+      --color-ink:     #1c1f26;   /* graphite */
+      --color-muted:   #4a5361;   /* slate */
+      --color-accent:  #a13d24;   /* oxide */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · recall</p>
+    <h1>System context — one binary wrapping one cache</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="recall-title recall-desc">
+      <title id="recall-title">System context — one binary wrapping one cache</title>
+      <desc id="recall-desc">Architecture diagram showing an unchanged OpenAI or Anthropic client pointed at recall, which replays stored replies on a semantic hit and forwards to the upstream LLM only on a miss, backed by a fixed SemanticCache whose embed, index, store and threshold seams are swappable.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4a5361"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a13d24"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f4f2ee"/>
+
+      <!-- ============ Connectors ============ -->
+
+      <line x1="216" y1="208" x2="304" y2="208" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="304" y1="256" x2="216" y2="256" stroke="#4a5361" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <path d="M 216,404 H 264 Q 272,404 272,396 V 312 Q 272,304 280,304 H 304"
+            fill="none" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="544" y1="192" x2="632" y2="192" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="544" y1="320" x2="632" y2="320" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="424" y1="328" x2="424" y2="392" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+      <!-- ============ Arrow labels ============ -->
+
+      <rect x="220" y="188" width="52" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="246" y="197" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REQUEST</text>
+
+      <rect x="222" y="236" width="72" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="258" y="245" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HIT · REPLAY</text>
+
+      <rect x="282" y="350" width="72" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="318" y="359" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">bench · replay</text>
+
+      <rect x="550" y="172" width="76" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="588" y="181" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MISS·FORWARD</text>
+
+      <rect x="550" y="300" width="52" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="576" y="309" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">/metrics</text>
+
+      <rect x="434" y="348" width="56" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="462" y="357" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LOOKUP</text>
+
+      <!-- ============ Nodes ============ -->
+
+      <!-- Client (input) -->
+      <rect x="40" y="176" width="176" height="112" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="176" width="176" height="112" rx="6" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <rect x="48" y="182" width="24" height="12" rx="2" fill="transparent" stroke="rgba(121,129,143,0.40)" stroke-width="0.8"/>
+      <text x="60" y="191" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SDK</text>
+      <text x="128" y="220" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">OpenAI / Anthropic</text>
+      <text x="128" y="240" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">client, unchanged</text>
+      <text x="128" y="256" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">base URL → recall</text>
+
+      <!-- ops tooling (input) -->
+      <rect x="40" y="352" width="176" height="104" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="352" width="176" height="104" rx="6" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <rect x="48" y="358" width="28" height="12" rx="2" fill="transparent" stroke="rgba(121,129,143,0.40)" stroke-width="0.8"/>
+      <text x="62" y="367" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OPS</text>
+      <text x="128" y="396" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ops tooling</text>
+      <text x="128" y="416" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">recall replay</text>
+      <text x="128" y="432" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">bench · ann-bench</text>
+
+      <!-- recall-proxy (FOCAL 1) -->
+      <rect x="304" y="152" width="240" height="176" rx="6" fill="#f4f2ee"/>
+      <rect x="304" y="152" width="240" height="176" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="312" y="158" width="36" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="330" y="167" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PROXY</text>
+      <text x="424" y="204" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">recall-proxy</text>
+      <text x="424" y="232" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum HTTP shell</text>
+      <text x="424" y="252" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/chat/completions</text>
+      <text x="424" y="268" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/messages</text>
+      <text x="424" y="284" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/cache/{lookup,insert}</text>
+      <text x="424" y="304" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">hit replays · miss forwards</text>
+
+      <!-- Upstream LLM (external) -->
+      <rect x="632" y="136" width="224" height="104" rx="6" fill="#f4f2ee"/>
+      <rect x="632" y="136" width="224" height="104" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="640" y="142" width="24" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="652" y="151" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LLM</text>
+      <text x="744" y="180" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Upstream LLM</text>
+      <text x="744" y="200" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">OpenAI / Anthropic</text>
+      <text x="744" y="216" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">reached only on a miss</text>
+
+      <!-- Prometheus (external) -->
+      <rect x="632" y="272" width="224" height="96" rx="6" fill="#f4f2ee"/>
+      <rect x="632" y="272" width="224" height="96" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="640" y="278" width="28" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="654" y="287" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OBS</text>
+      <text x="744" y="316" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Prometheus</text>
+      <text x="744" y="336" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">hit-rate · tokens saved</text>
+      <text x="744" y="352" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">scrapes /metrics</text>
+
+      <!-- SemanticCache (FOCAL 2) -->
+      <rect x="304" y="392" width="440" height="168" rx="6" fill="#f4f2ee"/>
+      <rect x="304" y="392" width="440" height="168" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="312" y="398" width="32" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="328" y="407" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CORE</text>
+      <text x="524" y="436" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SemanticCache</text>
+      <text x="524" y="460" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">recall-core — fixed; the four seams below are swappable</text>
+      <text x="524" y="484" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">embed — turn text into a vector</text>
+      <text x="524" y="504" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">index — find near vectors (HNSW)</text>
+      <text x="524" y="524" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">store — persist entries</text>
+      <text x="524" y="544" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">threshold — decide hit or miss</text>
+
+      <!-- ============ Legend ============ -->
+
+      <line x1="40" y1="604" x2="1240" y2="604" stroke="rgba(28,31,38,0.12)" stroke-width="0.8"/>
+      <text x="40" y="620" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="40" y="640" width="14" height="10" rx="2" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <text x="60" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Focal · the binary and its cache</text>
+
+      <rect x="380" y="640" width="14" height="10" rx="2" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <text x="400" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Caller</text>
+
+      <rect x="520" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <text x="540" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">External service</text>
+
+      <line x1="720" y1="645" x2="748" y2="645" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="756" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">HTTP</text>
+
+      <line x1="880" y1="645" x2="908" y2="645" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="916" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">In-process call</text>
+
+      <line x1="1080" y1="645" x2="1108" y2="645" stroke="#4a5361" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="1116" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Cache hit</text>
+    </svg>
+  </div>
+</body>
+</html>

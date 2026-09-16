@@ -89,15 +89,53 @@ Scrape `GET /metrics` per instance (full metric table in
 | `rate(recall_bypass_total)` | unexpectedly high share | callers sending tools / `n>1` / high temperature / `anthropic-beta` headers — cacheable traffic is lower than you think |
 | `recall_cache_get_duration_seconds` | p99 above your SLO | index too big for `brute` (consider `--index hnsw`, but validate recall first — see troubleshooting), or a slow embedder |
 | false-hit rate | above `--target-fhr` | measure with `recall replay --verify-sample`; raise τ or feed more `/v1/cache/feedback` |
+| `recall_rehydrated_entries` | 0 while `recall_store_info{durable="true"}` and `recall_persisted_entries_at_start` > 0 | a durable store recovered nothing — usually the embedder changed (rows written under a different embedder cannot be reused), so the cache is refilling from scratch at upstream prices |
+| `recall_fill_usage_unknown_total` / `recall_unpriced_fill_tokens_total` | rising | the fill cost is an under-count: responses arriving with no usage reported, or models missing from `[pricing.<model>]` |
 
 Logs: `RUST_LOG=info` for startup/reload/warnings; `RUST_LOG=recall=debug` for
 per-request hit/miss/bypass events (structural fields only — prompts and
 completions are never logged, by design).
 
-Savings validation: `recall replay --file reqs.jsonl --price-input … --price-output …`
-against a running instance reports hit-rate, the input/output token split, and a
-dollar estimate; `--verify-sample 0.1` re-asks the upstream for 10% of hits to
-sample the candidate false-hit rate.
+Savings validation: `recall status` summarizes a running instance in one screen;
+`recall replay --file reqs.jsonl` measures what a request log would have saved,
+with `--verify-sample 0.1` re-asking the upstream for 10% of hits to sample the
+false-hit rate. Both are in [CONFIG.md](./CONFIG.md#other-subcommands).
+
+### What a cache costs to fill, and what that does (and does not) tell you
+
+Every entry in the cache was bought once from the upstream. `recall_fill_*` is
+that side of the ledger — `recall_fill_cost_usd_total` against
+`recall_cost_saved_usd_total` is the ROI of this instance, both priced from your
+own `[pricing.<model>]` table:
+
+```promql
+# Payback: dollars saved per dollar spent filling, this instance, last 24h.
+increase(recall_cost_saved_usd_total[24h]) / increase(recall_fill_cost_usd_total[24h])
+```
+
+Read it for what it is. **Fill cost is the price of having a cache at all, not a
+tax on any particular topology** — a single instance that never restarts still
+buys every distinct entry exactly once. It becomes interesting when multiplied:
+by instances, and by restarts.
+
+recall does not do that multiplication, because an instance cannot see its
+siblings and will not claim otherwise. Your scraper can — it is the thing that
+genuinely sees every node:
+
+```promql
+count(recall_process_start_time_seconds)              # instances currently up
+sum(increase(recall_fill_cost_usd_total[24h]))        # fleet-wide fill spend, last 24h
+recall_rehydrated_entries / recall_persisted_entries_at_start   # cache recovered on last start
+```
+
+A counter that has reset is a process that restarted; `recall_process_start_time_seconds`
+marks exactly when, so `increase()` across a restart stays interpretable without recall
+having to invent a "cold window" of its own.
+
+`recall_store_info{backend,durable}` disambiguates the start-up gauges:
+`recall_rehydrated_entries 0` means "nothing to rebuild, as designed" on
+`backend="memory"` and "recovered nothing" on `durable="true"` — a distinction
+worth alerting on, since the second means a durable store is not doing its job.
 
 ## Troubleshooting (symptom-first)
 

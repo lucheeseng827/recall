@@ -33,6 +33,50 @@ pub struct Config {
     /// `x-api-key` used upstream when the incoming `/v1/messages` request carries none. When the
     /// caller sends their own `x-api-key`, it is forwarded as-is and this is unused. Env-only.
     pub anthropic_api_key: Option<String>,
+    /// The operator's model → rate table (`[pricing.<model>]` in `recall.toml`), used to turn saved
+    /// tokens into the `recall_cost_saved_usd_total` metric. Empty by default: recall ships no price
+    /// list and makes no network call, so the dollar figure is always the operator's own numbers or
+    /// nothing at all (see [`crate::pricing`]). Not hot-reloadable — a rate change needs a restart.
+    pub pricing: crate::pricing::PriceBook,
+    /// What the store was at start-up: which backend, and how much of a previous run's cache it
+    /// recovered. Facts, not knobs — the binary fills them in after opening the store, and
+    /// `/metrics` reports them so "did my cache survive the restart" is a ratio of two measured
+    /// numbers rather than a log line someone has to have been watching for.
+    pub store: StoreFacts,
+}
+
+/// What the store was when this process started.
+///
+/// Reported as-is and never editorialized: recall says which backend is in use and how many entries
+/// it recovered, and stops there. A node cannot observe what any other node holds, so it never
+/// claims anything about sharing — that arithmetic belongs to whatever is scraping every node,
+/// which genuinely can see them all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreFacts {
+    /// Backend name as the operator selected it (`memory`, `redb`).
+    pub backend: &'static str,
+    /// Whether that backend survives a restart at all. `false` for `memory`, where an empty cache
+    /// at start-up is the design rather than a loss.
+    pub durable: bool,
+    /// Rows the store held before rehydration ran — the denominator of "recovered N of M".
+    pub persisted_at_start: u64,
+    /// Entries rebuilt into the live index and exact-map at start-up: cache this process did **not**
+    /// have to buy again. Always 0 for an ephemeral backend, which has nothing to rebuild.
+    ///
+    /// Lower than `persisted_at_start` is expected, not an error — rows written under a different
+    /// embedder cannot be reused, because a different embedder re-keys similarity entirely.
+    pub rehydrated: u64,
+}
+
+impl Default for StoreFacts {
+    fn default() -> Self {
+        Self {
+            backend: "memory",
+            durable: false,
+            persisted_at_start: 0,
+            rehydrated: 0,
+        }
+    }
 }
 
 impl Default for Config {
@@ -48,6 +92,8 @@ impl Default for Config {
             anthropic_upstream_base: "https://api.anthropic.com".to_string(),
             anthropic_version: "2023-06-01".to_string(),
             anthropic_api_key: None,
+            pricing: crate::pricing::PriceBook::default(),
+            store: StoreFacts::default(),
         }
     }
 }
