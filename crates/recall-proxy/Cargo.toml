@@ -30,3 +30,7 @@ async-stream = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# Already in this crate's dependency graph (see `recall-core` above) — listed here so an
+# integration test can implement `Store` and build a cache whose writes fail on purpose. Adds no
+# crate to the build.
+recall-core = { path = "../recall-core" }

@@ -2,6 +2,16 @@
 
 # recall — self-hosted, Rust-native semantic cache
 
+> **Retired on 2026-11-21: not in active development.** The last release is
+> [v0.2.0](https://github.com/lucheeseng827/recall/releases/tag/recall-oss-v0.2.0) (2026-09-16).
+> No features, fixes or releases are planned. The code stays here under Apache-2.0, as it was,
+> and you are free to fork it. The changes recorded under `[Unreleased]` in
+> [`CHANGELOG.md`](CHANGELOG.md) were made after 0.2.0 and were never released.
+>
+> Why: in the two months after 0.2.0 it found no users beyond a handful, and the problem it
+> solves is now served inside the LLM gateways and managed caches people already run. A semantic
+> cache is better as a feature of the proxy in front of the model than as a separate project.
+
 `recall` is a semantic cache that sits in front of any OpenAI- or Anthropic-compatible LLM proxy and
 answers one question on the hot path: *"have we already semantically answered a prompt close enough
 to this one?"* On a hit it replays a stored completion without ever calling the upstream model; on a
@@ -9,7 +19,7 @@ miss it hands the caller back the query vector so the fresh completion is stored
 a single static **Apache-2.0** binary — or an embeddable library — with no external vector database,
 no mandatory network calls, and no Python supply chain.
 
-> **Status (M1 done; M2 in progress, OSS alpha):** the MVP loop (embed → ANN search → threshold
+> **Status (v0.2.0 — M1 done; M2 in progress):** the MVP loop (embed → ANN search → threshold
 > decision → hit/miss) runs end-to-end, and the proxy (`recall serve`) caches both OpenAI
 > `/v1/chat/completions` and Anthropic `/v1/messages` (each in its own namespace partition) for
 > **both non-streaming and streaming** requests. M2 so far adds an optional **static
@@ -18,9 +28,9 @@ no mandatory network calls, and no Python supply chain.
 > entries, so cached *hits* survive a restart, not just the blobs), the **adaptive threshold engine**
 > (`--policy adaptive`, off by default), **streaming-cache replay** (a streamed completion is
 > stored as raw SSE and replayed as a stream on a hit), and a pure-Rust **HNSW index** for scale
-> (`--index hnsw` — sublinear and 14–25× faster at 50k entries, but its recall@1 ≥ 0.98 gate is
-> validated only at low dimensionality; at the bundled 256-dim embedder's width it needs retuning —
-> run `recall ann-bench` for your dims/N before opting in).
+> (`--index hnsw` — sublinear; since 0.2.0 its recall@1 ≥ 0.98 gate holds at the bundled 256-dim
+> embedder's width at 10k entries (0.998), but recall decays with N — 0.876 at 50k on the default
+> `ef_search=256` — so run `recall ann-bench` for your dims/N before opting in).
 
 ## Workspace crates
 
@@ -30,7 +40,7 @@ no mandatory network calls, and no Python supply chain.
 | `recall-embed` | Real embedders. `static` feature = model2vec/potion (local-load, no network); default is a re-export of the deps-free `HashEmbedder`. |
 | `recall-store` | Durable `Store` backends. `redb` feature = pure-Rust ACID (restart-surviving, no C deps); default build is deps-free. |
 | `recall-calibrate` | The adaptive threshold engine: a feedback-driven `ThresholdPolicy` targeting a false-hit rate. Pure math, no deps. |
-| `recall-index` | At-scale `AnnIndex`: a pure-Rust, zero-dependency HNSW graph (sublinear; recall@1 ≥ 0.98 holds at low dims — needs retuning at 256-dim, validate with `recall ann-bench`). No external ANN crate — stays in the air-gap envelope. |
+| `recall-index` | At-scale `AnnIndex`: a pure-Rust, zero-dependency HNSW graph (sublinear; recall@1 ≥ 0.98 holds at 256-dim at 10k entries, then decays with N — validate with `recall ann-bench`). No external ANN crate — stays in the air-gap envelope. |
 | `recall-proxy` | OpenAI **and** Anthropic-compatible drop-in proxy + raw cache sidecar (axum). Caches non-streaming (JSON) and streaming (SSE) responses. |
 | `recall` | The `recall` binary: `serve` (proxy), `ask`, `bench`, `ann-bench` (index scaling), `replay` (savings validation). |
 
@@ -376,8 +386,9 @@ Use the deterministic hash embedder by default, or the real static embedder by b
 `--features static` and pointing `--model` at a local model2vec/potion directory (offline; no
 download). The ANN index is exact brute force by default (`--index brute`, the recall oracle); at
 scale the pure-Rust HNSW (`--index hnsw`, no extra dependency) is sublinear — but run `ann-bench`
-for your dims/N first: its recall@1 ≥ 0.98 gate has not been validated at the 256-dim production
-width. For a cache that survives restarts, build with
+for your dims/N first: at the 256-dim production width its recall@1 ≥ 0.98 gate holds at 10k
+entries (0.998) but not at 50k (0.876 on the default `ef_search=256`). For a cache that survives
+restarts, build with
 `--features store-redb` and run
 `recall serve --store redb --db-path /var/lib/recall/cache.redb` (pure-Rust ACID, no C deps); the
 default in-memory store is ephemeral. On startup `serve` **rehydrates** — it re-derives each
@@ -445,6 +456,49 @@ with no denominator abstains instead of printing `0.0%`.
 To feed your own tooling instead, `recall export` emits the same facts as one **versioned JSON
 document** (`recall.export/v1`, additive-only evolution, integer micro-USD, content-derived
 `export_id` for idempotent ingestion) — see [`docs/API.md`](./docs/API.md#export-format-recall-export--recallexportv1).
+
+### Trace it — OpenTelemetry `gen_ai.*` spans
+
+`/metrics` says how the node is doing. Spans say what happened to *that* request, in the vocabulary
+every LLM observability tool already reads:
+
+```sh
+RECALL_OTEL_ENDPOINT=http://collector:4318 recall serve
+```
+
+One span per proxied request, named `chat <model>` as the GenAI semantic conventions prescribe,
+carrying `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.request.model`, and recall's own
+`recall.cache.verdict` / `.score` / `.namespace`. The verdict is the same word the
+`x-recall-cache` header carries — `hit`, `miss`, `miss-nostore`, `bypass` — so a span and the
+response a caller saw line up without a mapping table. `gen_ai.provider.name` reads `openai` or
+`anthropic`, whichever front door the request came in through, and `gen_ai.response.model` is what
+the *response* named — so an alias that resolved to a dated snapshot upstream shows as one.
+
+A **raw sidecar lookup gets a span too, and it carries no `gen_ai.*` at all** — just
+`cache.lookup` with the verdict, namespace and score. That caller hands recall a namespace and a
+prompt and never says which model the entry is for, so every GenAI attribute would be one nobody
+named; filing it under a made-up model would put non-LLM traffic in an LLM cost dashboard.
+
+**A hit does not report `gen_ai.usage.*`** — no model call happened, and reporting usage tokens
+would have every tool that sums those attributes counting tokens nobody spent. A cache would
+inflate the spend dashboard of the team that installed it to cut spend. The avoided tokens go to
+`recall.saved.input_tokens` / `.output_tokens` / `.cost_micros` instead, where nothing reads them as
+spend. A miss or bypass did call a model, and reports real usage — and claims no saving, rather
+than a zero one that a savings dashboard would sum.
+
+Two details worth knowing before you build a dashboard on this. A **bypass has no
+`recall.cache.namespace`** at all: it never reached the cache, so there is no key, and an empty
+string would be something to group by that does not exist. And a **streamed span can disagree with
+the header the caller got** — `x-recall-cache` is written before the first byte of the body and
+cannot be taken back, so a stream that turns out to be truncated ships `miss` and is then dropped;
+the span is emitted at the true end of the stream and says `miss-nostore`. Where they differ, the
+span is the one that knows.
+
+**Prompts and completions are never exported, and cannot be** — the span type has no field that
+could carry either. Unset the endpoint and no exporter is built, no task is spawned and nothing
+leaves the process; export can never affect a request, because the queue is bounded (dropped and
+counted when full) and the flush is fire-and-forget. Details and the semconv version in
+[`docs/CONFIG.md`](docs/CONFIG.md).
 
 ### Report the savings in dollars
 

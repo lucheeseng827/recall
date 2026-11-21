@@ -1405,9 +1405,24 @@ fn cmd_serve(args: &[String]) -> i32 {
         anthropic_api_key,
         pricing,
         store: store_facts,
+        // Opt-in, by the presence of an endpoint alone — there is no enable flag to leave on with
+        // nowhere to send. Unset means no exporter is built and nothing leaves the process.
+        otel_endpoint: std::env::var("RECALL_OTEL_ENDPOINT")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        otel_service_name: std::env::var("RECALL_OTEL_SERVICE_NAME")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "recall".to_string()),
         ..Config::default()
     };
     let state = ProxyState::new(cache, config);
+
+    // `gen_ai.*` span export, when an OTLP endpoint is configured. A no-op otherwise — no task, no
+    // socket, no span leaving the process.
+    recall_proxy::spawn_span_flush(state.clone());
 
     // Savings-ledger persistence (durable store only, opt-in). Restore first — so the counters are
     // already whole before the listener accepts anything — then keep flushing them. The handle and

@@ -6,6 +6,156 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **Feedback for an unbounded number of namespaces could grow an adaptive policy's state without
+  limit.** `AdaptiveThreshold` kept a `HashMap` of learned per-namespace bands with no cap, and
+  `observe` is reachable from the network in exactly one place: `POST /v1/cache/feedback`, whose
+  `namespace` is taken **verbatim from the request body**. A client posting feedback under distinct
+  namespaces bought one permanent entry each, for as long as it kept posting — measured at 50,000
+  entries after 50,000 posts. Only `--policy adaptive` was affected; the default `--policy static`
+  keeps no per-namespace state (its `observe` is a no-op).
+
+  Now bounded at **512 namespaces**, matching the per-namespace savings ledger, which was already
+  bounded for exactly this reason. A newcomer past the cap **evicts a band rather than being turned
+  away**: refusing it would mean whoever filled the map first held it forever, so a namespace that
+  came up later — a new team, a new model, a service that simply started after the others — could
+  never learn at all.
+
+  Admission runs through a **doorkeeper**: a queue of at most 4096 namespaces the policy has heard
+  from, each costing two integers and a key rather than a band. A namespace earns a band on its
+  **second** observation — one is exactly what a namespace that posted once and never again looks
+  like, and telling those apart is the doorkeeper's whole job. A flood of distinct namespaces
+  therefore allocates **no bands at all** and evicts none, however long it runs: it only churns
+  against itself inside the queue.
+
+  The queue is eight times the band budget on purpose. A namespace posting feedback slowly needs
+  its first observation still remembered when its second arrives, and a flood ages out one
+  probationer per post — so what matters is how many posts it can land in between. The honest limit
+  is that a flood longer than the queue does age out a single knock; the cost is one observation,
+  never a band, and the namespace knocks again next time.
+
+  Taking a band from a full budget is an **admission decision**, and a comparative one — the
+  candidate must have knocked at least as many times as the band it would displace has been
+  observed. Without that the doorkeeper is only a speed bump: a flood pays two posts per namespace
+  and starts evicting bands with thousands of observations behind them. The displaced namespace
+  returns to the queue **carrying what it earned**, one knock from winning its slot back rather
+  than starting over; its moments do not survive, which is why that counts as an eviction.
+
+  **A lookup counts as a use, not only feedback**, so a namespace serving production traffic with no
+  feedback source attached keeps the cutoff its hits are served at. `decide` records that under the
+  read lock it already takes, never the write lock the hot path cannot afford, and it reads only the
+  band map — a namespace still at the door has learned nothing for traffic to protect. Reading a
+  band through the introspection accessors is deliberately *not* a use, so a metrics scrape cannot
+  perturb what it measures.
+
+  Bands are never merged into a shared overflow row the way the savings ledger merges its own. That
+  row only accounts, so merging there costs resolution and nothing else; this band *decides* — τ is
+  the cutoff a future lookup is measured against — and pooling distinct namespaces' score
+  distributions would let traffic that is not a namespace's own move that threshold. Evictions are
+  counted on the new `recall_policy_namespaces_evicted_total`.
+
+  `Namespace` also gained a **512-byte length cap**. Bounding how many keys those maps hold is only
+  half the memory when a single key can be arbitrarily long, and the sidecar takes its namespace
+  straight from the request body. The cap is far above anything the proxy derives
+  (`{base}:{flavor}:{model}:{fingerprint}`); a longer one is now a `400`.
+
+- **Rejected feedback was invisible.** All four `400` paths on `/v1/cache/feedback` returned without
+  counting anything, so a client sending `"incorrect"` instead of `"wrong"`, or a score on a 0–100
+  scale, left `recall_feedback_agree_total` and `recall_feedback_wrong_total` flat at zero — the
+  same picture as no client at all — while the policy trained on nothing and the observed false-hit
+  rate, the discount an honest savings figure is quoted net of, silently read as unmeasured. Now
+  counted on `recall_feedback_rejected_total`.
+
+- **The raw cache sidecar was invisible to `/metrics`.** `POST /v1/cache/lookup` counted nothing:
+  a deployment using recall as a semantic cache over HTTP — a supported front door — served hits
+  while `recall_hits_total`, `recall_misses_total` and `recall_requests_total` all read `0` and
+  `recall_hit_ratio` read `0.0000`. A cache that looks idle is a cache that gets turned off.
+  Sidecar lookups now count on the same hit/miss counters, the same
+  `recall_cache_get_duration_seconds` histogram and the same per-namespace breakdown as proxied
+  traffic, because they are the same question asked through a different door.
+
+  A sidecar hit credits `recall_hits_usage_unknown_total` rather than any token counter: it really
+  did avoid an upstream call, but the caller never said which model or how many tokens, so the
+  saving is real and unmeasurable. Counting it as zero saved would be a number; counting it as
+  unknown is the fact.
+
+### Changed
+- `recall_requests_total` now counts every request that **asked the cache for an answer** —
+  proxied completions plus raw sidecar lookups — where it previously counted only chat
+  completions. `/v1/cache/insert` and `/v1/cache/feedback` are still excluded: they do not ask the
+  cache anything. A dashboard reading it as "chat completions received" should read it as "cache
+  lookups served".
+
+### Added
+- **OpenTelemetry `gen_ai.*` spans for the cache decision** (`RECALL_OTEL_ENDPOINT`, unset by
+  default). One span per proxied request, named `{operation} {model}` as the GenAI semantic
+  conventions prescribe, so recall appears inside an existing tracing stack with nothing written to
+  adapt it. `/metrics` answers "how is this node doing"; this answers "what happened to *that*
+  request".
+
+  **A hit does not report `gen_ai.usage.*`.** That is the decision the feature turns on, not an
+  omission: no model call happened, so reporting usage tokens would have every tool that sums those
+  attributes counting tokens nobody spent — a cache inflating the spend dashboard of the team that
+  installed it to cut spend. The avoided tokens go to `recall.saved.input_tokens`,
+  `recall.saved.output_tokens` and `recall.saved.cost_micros`, where no standard aggregation reads
+  them as spend. A miss or bypass *did* call a model, and reports real usage — and no
+  `recall.saved.*`, because nothing was saved and a zero would sum into a savings figure as though
+  it were one. Usage the upstream never reported is **absent, not zero**: `0/0` would read as a
+  call that cost nothing rather than one whose cost is unknown.
+
+  `gen_ai.response.model` reports what the *response* named — not an echo of the request. Both
+  providers resolve aliases to dated snapshots, and that resolution is the only reason the
+  attribute is separate from `gen_ai.request.model`; an echo would make the two equal by
+  construction and tell a reader nothing. Absent when the response named nothing.
+
+  Every path emits, on both the OpenAI and the Anthropic front door: hit, buffered miss, streamed
+  miss and bypass. The **raw cache sidecar** emits too, as a `cache.lookup` span carrying **no
+  `gen_ai.*` attribute at all** — that caller supplies a namespace and a prompt and never names a
+  model, so GenAI attributes there would be invented and would file non-LLM traffic into an LLM
+  cost dashboard. The span type enforces it: the GenAI half is one optional field, so a sidecar
+  span has nowhere to put a model. Two consequences a dashboard
+  should know about. A **bypass has no `recall.cache.namespace`** — it never reached the cache, so
+  there is no key, and an empty string would be something to group by that does not exist. And a
+  **streamed span can disagree with the `x-recall-cache` header the caller got**: the header is
+  written before the first byte of the body and cannot be taken back, so a stream that later turns
+  out to be truncated ships `miss` and is then dropped. The span is emitted at the true end of the
+  stream — the first moment the outcome is known — and says `miss-nostore`. Where they differ, the
+  span is the accurate one.
+
+  **Prompts and completions are never exported**, and cannot be: the span type has no field that
+  could carry either. "Off by default" is not the same as impossible, and a cache whose argument is
+  that prompts stay put cannot ship telemetry that ships prompts. A test asserts no prompt text
+  appears in the encoded bytes.
+
+  Unset `RECALL_OTEL_ENDPOINT` means no exporter is built, no task is spawned and no span leaves the
+  process — the network-free default is untouched, and there is no separate enable flag to leave on
+  with nowhere to send. Export cannot affect a request: a bounded queue (dropped and counted when
+  full, never grown) feeds a background flush whose send is fire-and-forget, so a collector that is
+  slow or gone cannot reach back into the request path. Written against semantic conventions
+  **v1.40.0**; `gen_ai.provider.name` is replacing `gen_ai.system` and both are emitted during the
+  overlap.
+
+- **`recall_cache_put_duration_seconds`** — cache write latency (embed + store), the mirror of
+  `recall_cache_get_duration_seconds` on the other side of the cache. The lookup side has always
+  been timed; the write side never was, on any door. One histogram covers all three: a buffered
+  miss stored before its response returns (so the latency is on the caller's critical path), a
+  streamed miss stored after its last byte (so it is not), and `POST /v1/cache/insert`.
+
+  Observed whether the write **succeeded or failed**. A store that takes two seconds and then
+  errors is the case this exists to make visible, and timing only the successes would hide exactly
+  the slow path worth finding. A request rejected before it reaches the store — a malformed
+  namespace, say — is not observed: it never spent any time there.
+
+- **`recall_sidecar_inserts_total` / `recall_sidecar_insert_errors_total`** — entries handed to
+  the cache through `POST /v1/cache/insert` and successfully written, and those whose write failed.
+  The last unmetered thing on that door. Kept off the fill counters deliberately: a *fill* is an
+  entry recall bought with an upstream call it made and can price, while a sidecar insert was
+  bought by the caller, who never says what it cost — folding them together would put entries
+  recall never paid for into a figure that claims to be what filling this cache cost. Failures get
+  their own counter for the same reason the hit counters exist at all: a success-only counter
+  cannot tell an idle door from a broken one, and the caller's `500` never reaches the operator
+  watching `/metrics`.
+
 ## [0.2.0] — 2026-09-16
 
 ### Added

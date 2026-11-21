@@ -318,6 +318,35 @@ pub fn openai_usage(body: &str) -> TokenUsage {
 /// `message.usage`) while the cumulative `output_tokens` grows across `message_delta` events (usage
 /// top-level) — so each tier takes the maximum seen rather than the last, which is what makes the
 /// running total correct no matter which event the stream ended on.
+/// The model that actually answered, as the *response* reported it. This is not the requested
+/// model whenever the provider resolves an alias to a dated snapshot (`claude-sonnet-4-5` →
+/// `claude-sonnet-4-5-20250929`, `gpt-4o` → `gpt-4o-2024-08-06`) — which is precisely the fact
+/// `gen_ai.response.model` exists to carry.
+///
+/// Both flavours put it at the top level of a JSON response. In a stream OpenAI repeats it on every
+/// chunk, and Anthropic carries it once, nested under `message_start`'s `message`.
+///
+/// `None` when the body never said. Echoing the request back instead would make
+/// `gen_ai.response.model` equal to `gen_ai.request.model` by construction, so a reader comparing
+/// the two would learn nothing and would conclude no alias was ever resolved.
+pub fn response_model(body: &str) -> Option<String> {
+    fn pick(v: &Value) -> Option<String> {
+        v.get("model")
+            .or_else(|| v.get("message").and_then(|m| m.get("model")))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(m) = pick(&v) {
+            return Some(m);
+        }
+    }
+    sse_data_payloads(body)
+        .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+        .find_map(|v| pick(&v))
+}
+
 pub fn anthropic_usage(body: &str) -> TokenUsage {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         if let Some(u) = v.get("usage") {
@@ -794,6 +823,42 @@ mod tests {
             12
         );
         assert_eq!(anthropic_total_tokens(r#"{"no":"usage"}"#), 0);
+    }
+
+    #[test]
+    fn the_response_model_is_read_from_the_response_not_echoed_back() {
+        // The case the attribute exists for: an alias resolves upstream to a dated snapshot.
+        assert_eq!(
+            response_model(r#"{"id":"c1","model":"gpt-4o-2024-08-06","choices":[]}"#).as_deref(),
+            Some("gpt-4o-2024-08-06")
+        );
+        assert_eq!(
+            response_model(r#"{"id":"m1","type":"message","model":"claude-x-20260101"}"#)
+                .as_deref(),
+            Some("claude-x-20260101")
+        );
+        // Streamed: OpenAI repeats it on each chunk...
+        assert_eq!(
+            response_model(
+                "data: {\"model\":\"gpt-4o-2024-08-06\",\"choices\":[]}\n\ndata: [DONE]\n\n"
+            )
+            .as_deref(),
+            Some("gpt-4o-2024-08-06")
+        );
+        // ...while Anthropic carries it once, nested inside `message_start`.
+        assert_eq!(
+            response_model(concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-x-20260101\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .as_deref(),
+            Some("claude-x-20260101")
+        );
+        // Absent rather than guessed when the body never said, and an empty string is not a name.
+        assert_eq!(response_model(r#"{"id":"c1","choices":[]}"#), None);
+        assert_eq!(response_model(r#"{"model":""}"#), None);
+        assert_eq!(response_model("not json at all"), None);
     }
 
     #[test]

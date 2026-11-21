@@ -84,6 +84,66 @@ no TOML key:
 | `RECALL_UPSTREAM_API_KEY` | `Authorization: Bearer` sent to the OpenAI upstream **when the incoming request carries no `Authorization` header** (a caller-supplied header is forwarded as-is). |
 | `RECALL_ANTHROPIC_API_KEY` | `x-api-key` for the Anthropic upstream, same fallback-only semantics. |
 | `RUST_LOG` | tracing filter, default `info`. `RUST_LOG=recall=debug` logs per-request hit/miss/bypass (structural fields only — prompts/completions are never logged). |
+| `RECALL_OTEL_ENDPOINT` | OTLP/HTTP base for `gen_ai.*` span export, e.g. `http://collector:4318` (`/v1/traces` is appended). **Unset by default, and unset means no exporter is built and nothing leaves the process** — there is no separate enable flag to leave switched on with nowhere to send. |
+| `RECALL_OTEL_SERVICE_NAME` | `service.name` on exported spans. Default `recall`. Only read when an endpoint is set. |
+
+### `gen_ai.*` spans — what is and is not in them
+
+One span per proxied request, named `{operation} {model}` (e.g. `chat gpt-4o`) as the OpenTelemetry
+GenAI semantic conventions prescribe, carrying `gen_ai.provider.name`, `gen_ai.operation.name`,
+`gen_ai.request.model`, plus recall's own `recall.cache.verdict`, `recall.cache.score` and
+`recall.cache.namespace`. The verdict is the same word `x-recall-cache` carries — `hit`, `miss`,
+`miss-nostore`, `bypass` — so no mapping is needed between a span and the response a caller saw.
+`gen_ai.provider.name` is `openai` or `anthropic`, by which front door the request arrived at.
+
+**A raw sidecar lookup (`POST /v1/cache/lookup`) emits a `cache.lookup` span with no `gen_ai.*`
+attributes whatsoever** — only `recall.cache.verdict`, `.namespace` and `.score`. That caller
+supplies a namespace and a prompt and nothing more: no model, no vendor, no token count. Every
+GenAI attribute would therefore be invented, and would file non-LLM traffic into an LLM cost
+dashboard. The span type enforces it rather than the emit site: the GenAI half lives in one
+optional field, so a sidecar span has nowhere to put a model.
+
+**`gen_ai.response.model` is what the response named, and is absent when it named nothing.** Both
+providers resolve aliases to dated snapshots (`claude-sonnet-4-5` → `claude-sonnet-4-5-20250929`),
+and that resolution is the whole reason the attribute is separate from `gen_ai.request.model`.
+Echoing the request back would make the two equal by construction, so a reader comparing them would
+conclude no alias is ever resolved. A hit has no response model at all — nothing responded.
+
+**A hit does not report `gen_ai.usage.*`, and that is deliberate.** No model call happened, so
+reporting usage tokens would have every tool that sums those attributes — which is most of them —
+counting tokens nobody spent. A cache would inflate the spend dashboard of the team that installed
+it to reduce spend. The avoided tokens are reported instead under `recall.saved.input_tokens`,
+`recall.saved.output_tokens` and `recall.saved.cost_micros`, where no standard aggregation mistakes
+them for spend. On a miss or a bypass a model really did run, and `gen_ai.usage.*` is present —
+while `recall.saved.*` is absent, because nothing was saved and an explicit zero would sum into a
+savings figure as a real (if unimpressive) one.
+
+**Usage is absent rather than zero when the upstream did not report it.** A response carrying no
+usage object parses as `0/0`; exporting that would read as a call that cost nothing rather than one
+whose cost is unknown. This is the same distinction `recall_hits_usage_unknown_total` draws on the
+metrics side.
+
+**A bypass carries no `recall.cache.namespace`.** It never reached the cache, so there is no key —
+and an empty string would give a consumer something to group by that does not exist.
+
+**A streamed span may contradict the header the caller received.** `x-recall-cache` is written
+before the first byte of the body, so a streamed miss commits to `miss` before anyone can know
+whether the stream will terminate cleanly. A truncated stream is dropped rather than cached
+(`recall_stream_not_stored_total` counts it), and its span — emitted at the true end of the stream,
+which is the first moment the outcome is known — reports `miss-nostore`. The same applies to a
+buffered miss whose cache write fails. Where the two disagree, the span is the accurate one.
+
+**Prompts and completions are never exported.** The conventions define optional events carrying
+message content; recall does not implement them, and the span type has no field that could hold
+either — not an `Option`, not a redacted one. Same rule the request log already follows.
+
+The conventions are not stable yet. These names were checked against **v1.40.0**;
+`gen_ai.provider.name` is replacing `gen_ai.system`, and during the overlap both are emitted, so a
+consumer pinned to either finds what it is looking for.
+
+Export never affects a request: spans go to a bounded in-memory queue (dropped and counted when it
+is full rather than queued), and the flush is a background task whose send is fire-and-forget. A
+collector that is slow, wedged or gone cannot reach back into the request path.
 
 ## Hot reload (`--watch-config`)
 

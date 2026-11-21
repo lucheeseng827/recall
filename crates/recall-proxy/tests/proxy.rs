@@ -34,7 +34,7 @@ async fn mock_handler(State(st): State<Mock>, body: Bytes) -> Response {
     if is_stream_body(&body) {
         // Minimal OpenAI streaming shape: one content chunk + a terminal [DONE].
         let sse = format!(
-            "data: {{\"id\":\"chatcmpl-{n}\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"answer-{n}\"}}}}]}}\n\ndata: [DONE]\n\n"
+            "data: {{\"id\":\"chatcmpl-{n}\",\"object\":\"chat.completion.chunk\",\"model\":\"m-2026-01-01\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"answer-{n}\"}}}}]}}\n\ndata: [DONE]\n\n"
         );
         return Response::builder()
             .header("content-type", "text/event-stream")
@@ -44,7 +44,7 @@ async fn mock_handler(State(st): State<Mock>, body: Bytes) -> Response {
     // Real OpenAI usage carries the prompt/completion split AND total_tokens; the mock mirrors that so
     // the input/output savings metrics are exercised. prompt(4) + completion(6+n) = total(10+n).
     let body = format!(
-        r#"{{"id":"chatcmpl-{n}","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"answer-{n}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":4,"completion_tokens":{out},"total_tokens":{tok}}}}}"#,
+        r#"{{"id":"chatcmpl-{n}","object":"chat.completion","model":"m-2026-01-01","choices":[{{"index":0,"message":{{"role":"assistant","content":"answer-{n}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":4,"completion_tokens":{out},"total_tokens":{tok}}}}}"#,
         n = n,
         out = 6 + n,
         tok = 10 + n
@@ -60,9 +60,18 @@ async fn mock_handler(State(st): State<Mock>, body: Bytes) -> Response {
 async fn anthropic_mock_handler(State(st): State<Mock>, body: Bytes) -> Response {
     let n = st.calls.fetch_add(1, Ordering::SeqCst) + 1;
     if is_stream_body(&body) {
-        // Minimal Anthropic streaming shape: a text delta event + message_stop.
+        // The real Anthropic streaming shape, including where it puts usage: `message_start`
+        // carries `input_tokens` and a *partial* `output_tokens`, and the final count arrives much
+        // later on `message_delta`. A mock that omits both (as this one used to) makes every
+        // streamed Anthropic response look like it cost nothing, which is exactly the case the
+        // savings and span figures need to get right.
         let sse = format!(
-            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer-{n}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg-{n}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x-20260101\",\"content\":[],\"usage\":{{\"input_tokens\":5,\"output_tokens\":1}}}}}}\n\n\
+             event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"answer-{n}\"}}}}\n\n\
+             event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{out}}}}}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            n = n,
+            out = 6 + n
         );
         return Response::builder()
             .header("content-type", "text/event-stream")
@@ -70,7 +79,7 @@ async fn anthropic_mock_handler(State(st): State<Mock>, body: Bytes) -> Response
             .unwrap();
     }
     let body = format!(
-        r#"{{"id":"msg-{n}","type":"message","role":"assistant","model":"claude-x","content":[{{"type":"text","text":"answer-{n}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":{inp},"output_tokens":{out}}}}}"#,
+        r#"{{"id":"msg-{n}","type":"message","role":"assistant","model":"claude-x-20260101","content":[{{"type":"text","text":"answer-{n}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":{inp},"output_tokens":{out}}}}}"#,
         n = n,
         inp = 5,
         out = 6 + n
@@ -237,7 +246,7 @@ async fn hits_with_no_reported_usage_are_flagged_not_silently_zero() {
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
-    let (proxy, calls) = setup_fixed_sse_priced("/v1/chat/completions", sse).await;
+    let (proxy, calls) = setup_fixed_sse_priced("/v1/chat/completions", sse, "m").await;
     let client = reqwest::Client::new();
     let body = r#"{"model":"m","temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     for _ in 0..3 {
@@ -354,7 +363,7 @@ async fn streamed_fills_are_credited_only_when_the_stream_was_stored() {
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":2000,\"total_tokens\":3000}}\n\n",
         "data: [DONE]\n\n",
     );
-    let (proxy, _calls) = setup_fixed_sse_priced("/v1/chat/completions", sse).await;
+    let (proxy, _calls) = setup_fixed_sse_priced("/v1/chat/completions", sse, "m").await;
     let client = reqwest::Client::new();
     let body = r#"{"model":"m","temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let r = client
@@ -382,7 +391,7 @@ async fn streamed_fills_are_credited_only_when_the_stream_was_stored() {
 
     // Now a stream with no terminator: forwarded to the client, never stored — so no fill.
     let truncated = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
-    let (proxy2, _c2) = setup_fixed_sse_priced("/v1/chat/completions", truncated).await;
+    let (proxy2, _c2) = setup_fixed_sse_priced("/v1/chat/completions", truncated, "m").await;
     let r = client
         .post(format!("{proxy2}/v1/chat/completions"))
         .body(body)
@@ -483,6 +492,81 @@ async fn feedback_outcomes_are_counted_and_rejects_are_not() {
         m.contains("recall_hits_usage_unknown_total 0"),
         "metrics: {m}"
     );
+    // ...but they are not invisible. A client sending the wrong outcome word or a score on the
+    // wrong scale otherwise looks exactly like a client sending nothing, while the policy trains on
+    // nothing — and `wrong / (agree + wrong)` is the discount the savings figure is quoted net of.
+    assert!(
+        m.contains("recall_feedback_rejected_total 2"),
+        "metrics: {m}"
+    );
+    // The default policy keeps no per-namespace state, so it has nothing to evict.
+    assert!(
+        m.contains("recall_policy_namespaces_evicted_total 0"),
+        "metrics: {m}"
+    );
+}
+
+/// Every shape of malformed feedback is counted, not just the two the happy-path test happens to
+/// send. Each of these leaves `agree`/`wrong` untouched, which is exactly why they need a counter.
+#[tokio::test]
+async fn every_malformed_feedback_shape_is_counted_as_a_rejection() {
+    let (proxy, _calls) = setup().await;
+    let client = reqwest::Client::new();
+    let post = |body: String| {
+        let (c, p) = (client.clone(), proxy.clone());
+        async move {
+            c.post(format!("{p}/v1/cache/feedback"))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    // An empty namespace is not a namespace...
+    assert_eq!(
+        post(r#"{"namespace":"","score":0.9,"outcome":"wrong"}"#.into()).await,
+        400
+    );
+    // ...nor is one past the length cap, which exists because this value is retained as a map key.
+    let too_long = "n".repeat(600);
+    assert_eq!(
+        post(format!(
+            r#"{{"namespace":"{too_long}","score":0.9,"outcome":"wrong"}}"#
+        ))
+        .await,
+        400
+    );
+    // The wrong word for the right idea — the most likely real integration bug.
+    assert_eq!(
+        post(r#"{"namespace":"ns","score":0.9,"outcome":"incorrect"}"#.into()).await,
+        400
+    );
+    // A score on a 0–100 scale rather than a cosine similarity.
+    assert_eq!(
+        post(r#"{"namespace":"ns","score":91.0,"outcome":"wrong"}"#.into()).await,
+        400
+    );
+
+    let m = client
+        .get(format!("{proxy}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("recall_feedback_rejected_total 4"),
+        "metrics: {m}"
+    );
+    // None of them reached the policy, so the observed false-hit rate is untouched — which is the
+    // whole reason they must show up somewhere else.
+    assert!(m.contains("recall_feedback_agree_total 0"), "metrics: {m}");
+    assert!(m.contains("recall_feedback_wrong_total 0"), "metrics: {m}");
 }
 
 /// A **streamed** hit must credit its saved tokens and dollars, exactly like a non-streamed one.
@@ -498,7 +582,7 @@ async fn streamed_hits_credit_saved_tokens_and_dollars() {
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":2000,\"total_tokens\":3000}}\n\n",
         "data: [DONE]\n\n",
     );
-    let (proxy, calls) = setup_fixed_sse_priced("/v1/chat/completions", sse).await;
+    let (proxy, calls) = setup_fixed_sse_priced("/v1/chat/completions", sse, "m").await;
     let client = reqwest::Client::new();
     let body = r#"{"model":"m","temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
@@ -527,6 +611,12 @@ async fn streamed_hits_credit_saved_tokens_and_dollars() {
         .await
         .unwrap();
     assert!(m.contains("recall_hits_total 1"), "metrics: {m}");
+    // The streamed door writes too — once, at the end of the stream that was stored. The hit that
+    // followed replayed it and wrote nothing.
+    assert!(
+        m.contains("recall_cache_put_duration_seconds_count 1"),
+        "metrics: {m}"
+    );
     // The stored SSE says prompt 1000 / completion 2000 — the hit saved exactly those.
     assert!(m.contains("recall_tokens_saved_total 3000"), "metrics: {m}");
     assert!(
@@ -545,7 +635,11 @@ async fn streamed_hits_credit_saved_tokens_and_dollars() {
 }
 
 /// [`setup_fixed_sse`] with a price book covering the test model, for asserting streamed dollars.
-async fn setup_fixed_sse_priced(path: &str, sse: &'static str) -> (String, Arc<AtomicU64>) {
+async fn setup_fixed_sse_priced(
+    path: &str,
+    sse: &'static str,
+    priced_model: &str,
+) -> (String, Arc<AtomicU64>) {
     let calls = Arc::new(AtomicU64::new(0));
     let mock = Router::new()
         .route(path, post(fixed_sse_handler))
@@ -555,7 +649,7 @@ async fn setup_fixed_sse_priced(path: &str, sse: &'static str) -> (String, Arc<A
         });
     let upstream = serve(mock).await;
     let table: std::collections::HashMap<String, RateSpec> = [(
-        "m".to_string(),
+        priced_model.to_string(),
         RateSpec {
             input: 2.50,
             output: 10.00,
@@ -972,6 +1066,20 @@ async fn metrics_expose_latency_histograms() {
     // The upstream-forward histogram recorded the single miss's round-trip.
     assert!(
         m.contains("recall_upstream_duration_seconds_count 1"),
+        "{m}"
+    );
+    // ...and the write that stored it. On a buffered miss the store is on the request's critical
+    // path — it completes before the response returns — so this is latency the caller paid for.
+    assert!(
+        m.contains("# TYPE recall_cache_put_duration_seconds histogram"),
+        "{m}"
+    );
+    assert!(
+        m.contains("recall_cache_put_duration_seconds_bucket{le=\"0.005\"}"),
+        "{m}"
+    );
+    assert!(
+        m.contains("recall_cache_put_duration_seconds_count 1"),
         "{m}"
     );
 }
@@ -1405,4 +1513,925 @@ async fn a_hit_landing_mid_scrape_never_makes_the_rows_exceed_the_totals() {
             snap.tokens_saved
         );
     }
+}
+
+/// The whole point of the `gen_ai.*` export, proven through the real request path rather than on a
+/// hand-built span: a **hit made no model call**, so it must not report `gen_ai.usage.*`. Anything
+/// that sums those attributes — which is every LLM observability tool — would otherwise count
+/// tokens nobody spent, and a cache would inflate the spend dashboard of the team that installed it
+/// to cut spend.
+///
+/// The miss in the same test is the control: there a model really did run, so the usage attributes
+/// must be present.
+#[tokio::test]
+async fn a_hit_span_reports_saved_tokens_and_never_gen_ai_usage() {
+    use recall_proxy::otel;
+
+    let (proxy, queue, calls) = setup_exporting().await;
+
+    let body = serde_json::json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "what is a semantic cache" }],
+    });
+    let client = reqwest::Client::new();
+    let post = || {
+        client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&body)
+            .send()
+    };
+
+    // First call misses and populates; the second is served from cache.
+    assert_eq!(post().await.unwrap().status(), 200);
+    let hit = post().await.unwrap();
+    assert_eq!(hit.headers()["x-recall-cache"], "hit");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the hit called no upstream"
+    );
+
+    // Drain and encode exactly as the flush task would.
+    let (doc, spans) = exported(&queue);
+    let hit_span = with_verdict(&spans, "hit");
+
+    let k = span_keys(hit_span);
+    assert!(
+        !k.iter().any(|x| x == otel::ATTR_USAGE_INPUT_TOKENS),
+        "a hit must not report gen_ai usage — no model ran: {k:?}"
+    );
+    assert!(
+        !k.iter().any(|x| x == otel::ATTR_USAGE_OUTPUT_TOKENS),
+        "{k:?}"
+    );
+    // The avoided tokens ARE reported, under recall's own namespace.
+    assert!(
+        k.iter().any(|x| x == otel::ATTR_SAVED_INPUT_TOKENS),
+        "{k:?}"
+    );
+    assert!(k.iter().any(|x| x == otel::ATTR_SAVED_COST_MICROS), "{k:?}");
+    assert!(
+        k.iter().any(|x| x == otel::ATTR_NAMESPACE),
+        "a hit was served under a key: {k:?}"
+    );
+    // Convention basics that a collector keys on.
+    assert_eq!(hit_span["name"], "chat m");
+    assert!(k.iter().any(|x| x == otel::ATTR_PROVIDER_NAME));
+    assert!(
+        k.iter().any(|x| x == otel::ATTR_SYSTEM),
+        "migration overlap"
+    );
+
+    // No prompt or completion text anywhere in the document — the redaction rule, checked against
+    // the bytes that would actually be shipped rather than against the struct.
+    let wire = serde_json::to_string(&doc).unwrap();
+    assert!(
+        !wire.contains("what is a semantic cache"),
+        "a prompt reached the exported span"
+    );
+}
+
+// ----- OTLP span export: shared inspection helpers -----
+
+/// Drain the queue and encode it exactly as the flush task would, returning the OTLP document and
+/// its spans. Nothing connects to a collector in these tests — the queue is the seam.
+fn exported(queue: &recall_proxy::otel::SpanQueue) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let doc = recall_proxy::otel::encode_otlp("recall-test", &queue.drain());
+    let spans = doc["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    (doc, spans)
+}
+
+/// The attribute keys of one exported span.
+fn span_keys(s: &serde_json::Value) -> Vec<String> {
+    s["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["key"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// One attribute's value object, or `None` when the span does not carry that key.
+fn attr<'a>(s: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    s["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["key"] == key)
+        .map(|a| &a["value"])
+}
+
+/// The single exported span carrying `verdict`. Panics if there is not exactly one, so a test
+/// cannot silently pass by matching a span from some other request.
+fn with_verdict<'a>(spans: &'a [serde_json::Value], verdict: &str) -> &'a serde_json::Value {
+    let mut found = spans.iter().filter(|s| {
+        attr(s, recall_proxy::otel::ATTR_VERDICT).map(|v| v["stringValue"] == verdict) == Some(true)
+    });
+    let first = found
+        .next()
+        .unwrap_or_else(|| panic!("no span with verdict {verdict}: {spans:#?}"));
+    assert!(
+        found.next().is_none(),
+        "more than one {verdict} span: {spans:#?}"
+    );
+    first
+}
+
+/// A proxy over a fixed-SSE upstream with span export switched on. Returns (proxy_url, queue).
+async fn setup_fixed_sse_exporting(
+    path: &str,
+    sse: &'static str,
+) -> (String, Arc<recall_proxy::otel::SpanQueue>) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock = Router::new()
+        .route(path, post(fixed_sse_handler))
+        .with_state(SseMock { calls, sse });
+    let upstream = serve(mock).await;
+    let cache = Arc::new(boxed_memory_cache(0.9));
+    let config = Config {
+        upstream_base: upstream.clone(),
+        anthropic_upstream_base: upstream,
+        base_namespace: "test".into(),
+        max_temperature: 1.0,
+        otel_endpoint: Some("http://127.0.0.1:1/unused".into()),
+        otel_service_name: "recall-test".into(),
+        ..Config::default()
+    };
+    let state = ProxyState::new(cache, config);
+    let queue = state.otel.clone().expect("export is on");
+    (serve(app(state)).await, queue)
+}
+
+/// The mirror of the hit-span rule. A miss and a bypass both really ran a model, so the tokens they
+/// burned are the request's own spend and belong in `gen_ai.usage.*` — and neither may claim a
+/// saving, because neither saved anything. A bypass additionally has no cache key to report.
+#[tokio::test]
+async fn a_miss_and_a_bypass_report_the_tokens_a_model_actually_burned() {
+    use recall_proxy::otel;
+
+    let (proxy, queue, calls) = setup_exporting().await;
+    let client = reqwest::Client::new();
+
+    // (1) A cacheable request the cache cannot answer: forwarded, stored, `miss`.
+    let miss = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "what is a semantic cache" }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.headers()["x-recall-cache"], "miss");
+
+    // (2) A request above the temperature cap: never eligible, so it never touches the cache.
+    let bypass = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "temperature": 1.5,
+            "messages": [{ "role": "user", "content": "roll me a dice" }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bypass.headers()["x-recall-cache"], "bypass");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "both went upstream");
+
+    let (doc, spans) = exported(&queue);
+    let miss_span = with_verdict(&spans, "miss");
+    let bypass_span = with_verdict(&spans, "bypass");
+
+    for (label, span) in [("miss", miss_span), ("bypass", bypass_span)] {
+        let k = span_keys(span);
+        // A model ran, so its usage is reported as usage — the attribute a cost tool sums as spend.
+        assert!(
+            k.iter().any(|x| x == otel::ATTR_USAGE_INPUT_TOKENS),
+            "{label}: {k:?}"
+        );
+        assert!(
+            k.iter().any(|x| x == otel::ATTR_USAGE_OUTPUT_TOKENS),
+            "{label}: {k:?}"
+        );
+        // ...and nothing was saved, so nothing is claimed. An explicit zero would read as a real
+        // (if unimpressive) saving and would sum into a savings dashboard as one.
+        assert!(
+            !k.iter().any(|x| x == otel::ATTR_SAVED_INPUT_TOKENS),
+            "{label} claimed a saving: {k:?}"
+        );
+        assert!(
+            !k.iter().any(|x| x == otel::ATTR_SAVED_COST_MICROS),
+            "{label} claimed a saving: {k:?}"
+        );
+        // A score is a hit's similarity to a stored entry; neither of these compared anything.
+        assert!(!k.iter().any(|x| x == otel::ATTR_SCORE), "{label}: {k:?}");
+        assert_eq!(span["name"], "chat m");
+    }
+
+    // The figures are the mock's own (`prompt_tokens: 4`, `completion_tokens: 6 + call number`),
+    // which is what makes this a test of parsing the real response rather than of plumbing.
+    // Encoded as strings because OTLP maps a 64-bit int to JSON that way.
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_INPUT_TOKENS).unwrap()["intValue"],
+        "4"
+    );
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "7"
+    );
+    assert_eq!(
+        attr(bypass_span, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "8"
+    );
+
+    // The alias the caller asked for is not the model that answered. Both mocks resolve one, as
+    // every real provider does; an attribute echoing the request back would hide that entirely.
+    for (label, span) in [("miss", miss_span), ("bypass", bypass_span)] {
+        assert_eq!(
+            attr(span, otel::ATTR_REQUEST_MODEL).unwrap()["stringValue"],
+            "m"
+        );
+        assert_eq!(
+            attr(span, otel::ATTR_RESPONSE_MODEL).unwrap()["stringValue"],
+            "m-2026-01-01",
+            "{label}: the responding model, not the requested one"
+        );
+    }
+
+    // The one structural difference: a miss was looked up under a key, a bypass never had one.
+    assert!(attr(miss_span, otel::ATTR_NAMESPACE).is_some());
+    assert!(
+        attr(bypass_span, otel::ATTR_NAMESPACE).is_none(),
+        "a bypass never reached the cache, so it has no namespace to group by"
+    );
+
+    // Redaction holds on every path, not just the hit one.
+    let wire = serde_json::to_string(&doc).unwrap();
+    assert!(!wire.contains("what is a semantic cache"), "prompt leaked");
+    assert!(!wire.contains("roll me a dice"), "prompt leaked");
+}
+
+/// The streamed miss, where the span is the *only* honest record. `x-recall-cache` is written
+/// before the first byte of the body and can never be corrected, so a stream that turns out to be
+/// truncated ships a `miss` header and is dropped. The span is emitted at the true end of the
+/// stream and says `miss-nostore`.
+#[tokio::test]
+async fn a_streamed_span_outranks_the_header_it_could_not_take_back() {
+    use recall_proxy::otel;
+
+    let body = r#"{"model":"m","temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let client = reqwest::Client::new();
+
+    // A clean stream, with the usage chunk OpenAI sends under `stream_options.include_usage`.
+    let whole = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"whole\"}}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":9,\"total_tokens\":13}}\n\n\
+                 data: [DONE]\n\n";
+    let (proxy, queue) = setup_fixed_sse_exporting("/v1/chat/completions", whole).await;
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["x-recall-cache"], "miss");
+    // Draining the body is what runs the store decision — and therefore the span.
+    let _ = r.text().await.unwrap();
+
+    let (_, spans) = exported(&queue);
+    let stored = with_verdict(&spans, "miss");
+    assert_eq!(
+        attr(stored, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "9",
+        "usage recovered from the assembled SSE, not from a JSON body"
+    );
+    assert!(attr(stored, otel::ATTR_NAMESPACE).is_some());
+
+    // The same request shape against an upstream that half-closes without `[DONE]`.
+    let truncated = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    let (proxy, queue) = setup_fixed_sse_exporting("/v1/chat/completions", truncated).await;
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.headers()["x-recall-cache"],
+        "miss",
+        "the header is committed before the body — it cannot know yet"
+    );
+    let _ = r.text().await.unwrap();
+
+    let (_, spans) = exported(&queue);
+    let dropped = with_verdict(&spans, "miss-nostore");
+    // The namespace is still known (the lookup happened); the usage is not, because the completion
+    // never arrived whole — absent rather than a confident zero.
+    assert!(attr(dropped, otel::ATTR_NAMESPACE).is_some());
+    assert!(
+        attr(dropped, otel::ATTR_USAGE_INPUT_TOKENS).is_none(),
+        "a truncated stream reported no usage to stand behind"
+    );
+    assert!(
+        attr(dropped, otel::ATTR_SAVED_INPUT_TOKENS).is_none(),
+        "nothing was stored, so nothing was saved"
+    );
+}
+
+/// A proxy over the shared OpenAI + Anthropic mock with span export on and both mock models priced,
+/// so a span test can assert `recall.saved.cost_micros` on either flavour. Returns
+/// (proxy_url, span_queue, upstream_call_counter).
+async fn setup_exporting() -> (String, Arc<recall_proxy::otel::SpanQueue>, Arc<AtomicU64>) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock = Router::new()
+        .route("/v1/chat/completions", post(mock_handler))
+        .route("/v1/messages", post(anthropic_mock_handler))
+        .with_state(Mock {
+            calls: calls.clone(),
+        });
+    let upstream = serve(mock).await;
+
+    let rate = RateSpec {
+        input: 2.50,
+        output: 10.00,
+    };
+    let table: std::collections::HashMap<String, RateSpec> =
+        [("m".to_string(), rate), ("claude-x".to_string(), rate)]
+            .into_iter()
+            .collect();
+
+    let cache = Arc::new(boxed_memory_cache(0.9));
+    let config = Config {
+        upstream_base: upstream.clone(),
+        anthropic_upstream_base: upstream,
+        base_namespace: "test".into(),
+        max_temperature: 1.0,
+        pricing: PriceBook::load(&table).0,
+        // An endpoint is what turns export on. Nothing ever connects to it here — the queue is
+        // drained directly, so the test exercises the span contents without a collector.
+        otel_endpoint: Some("http://127.0.0.1:1/unused".into()),
+        otel_service_name: "recall-test".into(),
+        ..Config::default()
+    };
+    let state = ProxyState::new(cache, config);
+    let queue = state.otel.clone().expect("export is on");
+    (serve(app(state)).await, queue, calls)
+}
+
+/// The Anthropic flavour reports itself as Anthropic, on every verdict, with usage read out of the
+/// Anthropic response shape (`usage.input_tokens` / `output_tokens` — not OpenAI's `prompt_tokens`).
+/// The two flavours share one span path, so what is worth checking here is the flavour-specific
+/// parts: the provider name, the usage keys, and the bypass reason only Anthropic has.
+#[tokio::test]
+async fn the_anthropic_flavour_reports_itself_in_every_verdict() {
+    use recall_proxy::otel;
+
+    let (proxy, queue, calls) = setup_exporting().await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"claude-x","max_tokens":1024,"temperature":0,"messages":[{"role":"user","content":"what is a semantic cache"}]}"#;
+
+    // Miss (stores), then hit (replays) — the upstream is called exactly once.
+    let miss = client
+        .post(format!("{proxy}/v1/messages"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.headers()["x-recall-cache"], "miss");
+    let hit = client
+        .post(format!("{proxy}/v1/messages"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hit.headers()["x-recall-cache"], "hit");
+
+    // The bypass reason only this flavour has: `anthropic-beta` changes upstream behaviour but is
+    // not part of the body the key is derived from, so the request is never eligible.
+    let bypass = client
+        .post(format!("{proxy}/v1/messages"))
+        .header("anthropic-beta", "some-feature-2024-01-01")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bypass.headers()["x-recall-cache"],
+        "bypass",
+        "a variant header must not share a cached answer"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "the hit called no upstream"
+    );
+
+    let (doc, spans) = exported(&queue);
+    let miss_span = with_verdict(&spans, "miss");
+    let hit_span = with_verdict(&spans, "hit");
+    let bypass_span = with_verdict(&spans, "bypass");
+
+    for (label, span) in [
+        ("miss", miss_span),
+        ("hit", hit_span),
+        ("bypass", bypass_span),
+    ] {
+        // Both names during the semconv migration overlap, and both say `anthropic` — an OpenAI
+        // label here would file every Claude call under the wrong vendor in a cost report.
+        for key in [otel::ATTR_PROVIDER_NAME, otel::ATTR_SYSTEM] {
+            assert_eq!(
+                attr(span, key).unwrap()["stringValue"],
+                "anthropic",
+                "{label}/{key}"
+            );
+        }
+        assert_eq!(span["name"], "chat claude-x", "{label}");
+    }
+
+    // The mock's Anthropic-shaped usage: `input_tokens: 5`, `output_tokens: 6 + call number`. The
+    // first call is the one that missed, so the miss reports 5/7.
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_INPUT_TOKENS).unwrap()["intValue"],
+        "5"
+    );
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "7"
+    );
+    // The bypass was the second upstream call.
+    assert_eq!(
+        attr(bypass_span, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "8"
+    );
+    assert!(
+        attr(bypass_span, otel::ATTR_NAMESPACE).is_none(),
+        "a bypassed Anthropic request has no cache key either"
+    );
+
+    // Anthropic resolves the alias too, and the span reports what answered rather than what was
+    // asked for. A hit has no response model at all — nothing responded to it.
+    for (label, span) in [("miss", miss_span), ("bypass", bypass_span)] {
+        assert_eq!(
+            attr(span, otel::ATTR_REQUEST_MODEL).unwrap()["stringValue"],
+            "claude-x"
+        );
+        assert_eq!(
+            attr(span, otel::ATTR_RESPONSE_MODEL).unwrap()["stringValue"],
+            "claude-x-20260101",
+            "{label}: the responding model, not the requested one"
+        );
+    }
+    assert!(attr(hit_span, otel::ATTR_RESPONSE_MODEL).is_none());
+
+    // The hit replayed the stored body, so it saved exactly what that body reported — reported as a
+    // saving, never as usage, and priced because `claude-x` is in the book.
+    assert!(attr(hit_span, otel::ATTR_USAGE_INPUT_TOKENS).is_none());
+    assert_eq!(
+        attr(hit_span, otel::ATTR_SAVED_INPUT_TOKENS).unwrap()["intValue"],
+        "5"
+    );
+    assert_eq!(
+        attr(hit_span, otel::ATTR_SAVED_OUTPUT_TOKENS).unwrap()["intValue"],
+        "7"
+    );
+    assert!(attr(hit_span, otel::ATTR_SAVED_COST_MICROS).is_some());
+
+    let wire = serde_json::to_string(&doc).unwrap();
+    assert!(!wire.contains("what is a semantic cache"), "prompt leaked");
+}
+
+/// Anthropic splits usage across two events that can be thousands of tokens apart in the stream:
+/// `message_start` carries `input_tokens` and a placeholder `output_tokens`, and the real output
+/// count only arrives on `message_delta`. Reading "the last usage object" — which is right for
+/// OpenAI — would report an input of zero here. Both the span and the savings ledger depend on the
+/// two being recombined, so this asserts it end to end rather than over a string fixture.
+#[tokio::test]
+async fn an_anthropic_streamed_span_reassembles_usage_split_across_two_events() {
+    use recall_proxy::otel;
+
+    let (proxy, queue, calls) = setup_exporting().await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"claude-x","max_tokens":1024,"temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    let miss = client
+        .post(format!("{proxy}/v1/messages"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.headers()["x-recall-cache"], "miss");
+    // Draining the body is what runs the store decision, and therefore the span.
+    let _ = miss.text().await.unwrap();
+
+    let hit = client
+        .post(format!("{proxy}/v1/messages"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hit.headers()["x-recall-cache"], "hit");
+    let _ = hit.text().await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let (_, spans) = exported(&queue);
+    let miss_span = with_verdict(&spans, "miss");
+    let hit_span = with_verdict(&spans, "hit");
+
+    // `input_tokens: 5` came from `message_start`; `output_tokens: 7` from `message_delta`, which
+    // also had to beat the placeholder `1` that `message_start` carried.
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_INPUT_TOKENS).unwrap()["intValue"],
+        "5",
+        "input came from message_start and was not overwritten by the later event"
+    );
+    assert_eq!(
+        attr(miss_span, otel::ATTR_USAGE_OUTPUT_TOKENS).unwrap()["intValue"],
+        "7",
+        "output came from message_delta, not the message_start placeholder"
+    );
+    // Read out of `message_start`, the only event in an Anthropic stream that names the model.
+    assert_eq!(
+        attr(miss_span, otel::ATTR_RESPONSE_MODEL).unwrap()["stringValue"],
+        "claude-x-20260101"
+    );
+
+    // The hit re-reads the same figures out of the *stored SSE* — a second, independent exercise of
+    // the same reassembly, this time against the cache rather than the wire.
+    assert_eq!(
+        attr(hit_span, otel::ATTR_SAVED_INPUT_TOKENS).unwrap()["intValue"],
+        "5"
+    );
+    assert_eq!(
+        attr(hit_span, otel::ATTR_SAVED_OUTPUT_TOKENS).unwrap()["intValue"],
+        "7"
+    );
+}
+
+/// The Anthropic mirror of `streamed_hits_credit_saved_tokens_and_dollars`: the same reassembly,
+/// read through `/metrics` rather than a span, so the savings figure the product is sold on is
+/// covered on both flavours.
+#[tokio::test]
+async fn anthropic_streamed_hits_credit_saved_tokens_and_dollars() {
+    // A full Anthropic stream: usage opens on `message_start` and closes on `message_delta`.
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[],\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2000}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (proxy, calls) = setup_fixed_sse_priced("/v1/messages", sse, "claude-x").await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"claude-x","max_tokens":1024,"temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    // Miss (stores the stream), then hit (replays it).
+    for _ in 0..2 {
+        let r = client
+            .post(format!("{proxy}/v1/messages"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let _ = r.text().await.unwrap();
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "second request served from cache"
+    );
+
+    let m = client
+        .get(format!("{proxy}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(m.contains("recall_hits_total 1"), "metrics: {m}");
+    // 1000 input + 2000 output, recombined from the two events the stream split them across.
+    assert!(m.contains("recall_tokens_saved_total 3000"), "metrics: {m}");
+    assert!(
+        m.contains("recall_input_tokens_saved_total 1000"),
+        "metrics: {m}"
+    );
+    assert!(
+        m.contains("recall_output_tokens_saved_total 2000"),
+        "metrics: {m}"
+    );
+    // 1000 @ $2.50/1M + 2000 @ $10.00/1M = $0.0225.
+    assert!(
+        m.contains("recall_cost_saved_usd_total 0.0225"),
+        "metrics: {m}"
+    );
+    assert!(
+        !m.contains("recall_hits_usage_unknown_total 1"),
+        "usage was known — the split must not read as absent: {m}"
+    );
+}
+
+/// The sidecar is a front door, and it used to be invisible from one. A deployment using recall as
+/// a raw semantic cache over HTTP served hits while `/metrics` reported `recall_hits_total 0` and a
+/// hit ratio of zero — a cache that looks idle is a cache that gets turned off.
+#[tokio::test]
+async fn sidecar_lookups_are_visible_in_the_same_counters_as_proxied_ones() {
+    let (proxy, calls) = setup().await;
+    let client = reqwest::Client::new();
+    let lookup = |prompt: &'static str| {
+        client
+            .post(format!("{proxy}/v1/cache/lookup"))
+            .json(&serde_json::json!({ "namespace": "raw", "prompt": prompt }))
+            .send()
+    };
+
+    // Two misses, an insert, then a lookup that hits the inserted entry.
+    assert_eq!(lookup("hello").await.unwrap().status(), 200);
+    assert_eq!(lookup("hello").await.unwrap().status(), 200);
+    client
+        .post(format!("{proxy}/v1/cache/insert"))
+        .json(&serde_json::json!({"namespace":"raw","prompt":"hello","completion":"world"}))
+        .send()
+        .await
+        .unwrap();
+    let hit: serde_json::Value = lookup("hello").await.unwrap().json().await.unwrap();
+    assert_eq!(hit["hit"], true, "{hit}");
+    assert_eq!(hit["completion"], "world");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the sidecar never forwards anywhere"
+    );
+
+    let m = client
+        .get(format!("{proxy}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(m.contains("recall_hits_total 1"), "metrics: {m}");
+    assert!(m.contains("recall_misses_total 2"), "metrics: {m}");
+    // Three lookups asked the cache a question; the insert did not.
+    assert!(m.contains("recall_requests_total 3"), "metrics: {m}");
+    assert!(m.contains("recall_hit_ratio 0.3333"), "metrics: {m}");
+    // The latency histogram covers sidecar lookups too — it is the same lookup.
+    assert!(
+        m.contains("recall_cache_get_duration_seconds_count 3"),
+        "metrics: {m}"
+    );
+    // The hit avoided an upstream call, but the caller never said which model or how many tokens.
+    // Counted as a saving of unknown size, never as a saving of zero.
+    assert!(
+        m.contains("recall_hits_usage_unknown_total 1"),
+        "metrics: {m}"
+    );
+    assert!(m.contains("recall_tokens_saved_total 0"), "metrics: {m}");
+    assert!(
+        m.contains("recall_cost_saved_usd_total 0.000000"),
+        "metrics: {m}"
+    );
+
+    // The insert landed, on its own counter. Never on the fill counters: a fill is an entry recall
+    // bought with an upstream call it made and can price, and this one the caller paid for.
+    assert!(m.contains("recall_sidecar_inserts_total 1"), "metrics: {m}");
+    assert!(
+        m.contains("recall_sidecar_insert_errors_total 0"),
+        "metrics: {m}"
+    );
+    assert!(m.contains("recall_fill_entries_total 0"), "metrics: {m}");
+    // The write is timed on the same histogram as a proxied one — same work, different door. The
+    // three lookups wrote nothing, so the insert is the only observation.
+    assert!(
+        m.contains("recall_cache_put_duration_seconds_count 1"),
+        "metrics: {m}"
+    );
+
+    // And the namespace shows up in the per-namespace breakdown, serving hits it cannot price.
+    let ns: serde_json::Value = client
+        .get(format!("{proxy}/v1/cache/namespaces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = ns["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["namespace"] == "raw")
+        .unwrap_or_else(|| panic!("no row for the sidecar namespace: {ns}"));
+    assert_eq!(row["hits"], 1, "{row}");
+}
+
+/// A sidecar span says what recall knows and nothing else. The caller handed over a namespace and a
+/// prompt; a `gen_ai.request.model` here would be a model nobody named.
+#[tokio::test]
+async fn a_sidecar_span_carries_the_cache_verdict_and_no_gen_ai_attributes() {
+    use recall_proxy::otel;
+
+    let (proxy, queue, _calls) = setup_exporting().await;
+    let client = reqwest::Client::new();
+    let lookup = || {
+        client
+            .post(format!("{proxy}/v1/cache/lookup"))
+            .json(&serde_json::json!({"namespace":"raw","prompt":"what is a semantic cache"}))
+            .send()
+    };
+
+    assert_eq!(lookup().await.unwrap().status(), 200);
+    client
+        .post(format!("{proxy}/v1/cache/insert"))
+        .json(&serde_json::json!({
+            "namespace": "raw",
+            "prompt": "what is a semantic cache",
+            "completion": "a cache keyed by meaning",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let hit: serde_json::Value = lookup().await.unwrap().json().await.unwrap();
+    assert_eq!(hit["hit"], true, "{hit}");
+
+    let (doc, spans) = exported(&queue);
+    let miss_span = with_verdict(&spans, "miss");
+    let hit_span = with_verdict(&spans, "hit");
+
+    for (label, span) in [("miss", miss_span), ("hit", hit_span)] {
+        let k = span_keys(span);
+        assert!(
+            k.iter().all(|key| !key.starts_with("gen_ai.")),
+            "{label} carried a gen_ai attribute: {k:?}"
+        );
+        assert_eq!(
+            span["name"], "cache.lookup",
+            "{label} must not be named as a model call"
+        );
+        assert_eq!(
+            attr(span, otel::ATTR_NAMESPACE).unwrap()["stringValue"],
+            "raw"
+        );
+        // Nothing is claimed as saved — the caller knows what it saved, recall does not.
+        assert!(
+            !k.iter().any(|x| x == otel::ATTR_SAVED_INPUT_TOKENS),
+            "{label}: {k:?}"
+        );
+    }
+    // The score is the one thing a sidecar hit can report that a miss cannot.
+    assert!(attr(hit_span, otel::ATTR_SCORE).is_some());
+    assert!(attr(miss_span, otel::ATTR_SCORE).is_none());
+
+    // The redaction rule holds on this door too — the prompt is the request body here.
+    let wire = serde_json::to_string(&doc).unwrap();
+    assert!(!wire.contains("what is a semantic cache"), "prompt leaked");
+    assert!(
+        !wire.contains("a cache keyed by meaning"),
+        "completion leaked"
+    );
+}
+
+// ----- A store whose writes fail, so the "the write did not happen" paths are reachable -----
+
+/// Reads like an empty cache and refuses every write. The in-memory store has no failure mode, so
+/// without this the store-failed branches — which are the ones that decide whether a counter or a
+/// span tells the truth — could only be reasoned about, never run.
+struct FailingStore;
+
+impl recall_core::Store for FailingStore {
+    fn get(
+        &self,
+        _key: recall_core::Key,
+    ) -> Result<Option<recall_core::Entry>, recall_core::RecallError> {
+        Ok(None)
+    }
+    fn put(
+        &self,
+        _key: recall_core::Key,
+        _entry: &recall_core::Entry,
+    ) -> Result<(), recall_core::RecallError> {
+        Err(recall_core::RecallError::Backend("store is full".into()))
+    }
+    fn remove(&self, _key: recall_core::Key) -> Result<(), recall_core::RecallError> {
+        Ok(())
+    }
+    fn len(&self) -> usize {
+        0
+    }
+}
+
+/// A proxy over the shared mock whose cache cannot be written to, with span export on.
+async fn setup_failing_store() -> (String, Arc<recall_proxy::otel::SpanQueue>) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock = Router::new()
+        .route("/v1/chat/completions", post(mock_handler))
+        .with_state(Mock { calls });
+    let upstream = serve(mock).await;
+    let cache = Arc::new(recall_proxy::boxed_cache_full(
+        Box::new(recall_core::HashEmbedder::default()),
+        Box::new(FailingStore),
+        Box::new(recall_core::StaticThreshold::new(0.9)),
+    ));
+    let config = Config {
+        upstream_base: upstream.clone(),
+        anthropic_upstream_base: upstream,
+        base_namespace: "test".into(),
+        max_temperature: 1.0,
+        otel_endpoint: Some("http://127.0.0.1:1/unused".into()),
+        otel_service_name: "recall-test".into(),
+        ..Config::default()
+    };
+    let state = ProxyState::new(cache, config);
+    let queue = state.otel.clone().expect("export is on");
+    (serve(app(state)).await, queue)
+}
+
+/// A sidecar insert that does not land must say so on a counter, not only in the caller's `500`.
+/// A success-only counter cannot tell an idle door from a broken one — both leave it flat — which
+/// is the same blind spot that made the whole sidecar invisible.
+#[tokio::test]
+async fn a_sidecar_insert_that_fails_to_store_is_counted_as_a_failure() {
+    let (proxy, _queue) = setup_failing_store().await;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .post(format!("{proxy}/v1/cache/insert"))
+        .json(&serde_json::json!({"namespace":"raw","prompt":"hi","completion":"there"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500, "the caller is told");
+
+    // A malformed request is rejected before any write is attempted, so it is neither a stored
+    // entry nor a failed one — it never reached the store.
+    let bad = client
+        .post(format!("{proxy}/v1/cache/insert"))
+        .json(&serde_json::json!({"namespace":"","prompt":"hi","completion":"there"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    let m = client
+        .get(format!("{proxy}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains("recall_sidecar_insert_errors_total 1"),
+        "metrics: {m}"
+    );
+    assert!(m.contains("recall_sidecar_inserts_total 0"), "metrics: {m}");
+    // The failed write is still timed. A store that takes two seconds and *then* errors is the
+    // case the histogram matters most for; timing only successes would hide it. The rejected
+    // request is not counted — it never reached the store to take any time in it.
+    assert!(
+        m.contains("recall_cache_put_duration_seconds_count 1"),
+        "metrics: {m}"
+    );
+}
+
+/// The claim the buffered miss path makes in a comment, actually run: `x-recall-cache` is chosen
+/// before the write is attempted, so a failed put still ships `miss` — and the span, emitted after,
+/// says `miss-nostore`. Until a store could fail, only the truncated-stream case exercised this.
+#[tokio::test]
+async fn a_miss_whose_write_fails_ships_a_miss_header_and_a_miss_nostore_span() {
+    use recall_proxy::otel;
+
+    let (proxy, queue) = setup_failing_store().await;
+    let client = reqwest::Client::new();
+
+    let r = client
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "hello" }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "the caller still gets its answer");
+    assert_eq!(
+        r.headers()["x-recall-cache"],
+        "miss",
+        "the header is committed before the write is attempted"
+    );
+
+    let (_, spans) = exported(&queue);
+    let span = with_verdict(&spans, "miss-nostore");
+    assert!(attr(span, otel::ATTR_NAMESPACE).is_some());
+    // A model really ran, so the tokens are still the request's own spend.
+    assert_eq!(
+        attr(span, otel::ATTR_USAGE_INPUT_TOKENS).unwrap()["intValue"],
+        "4"
+    );
+    assert!(
+        attr(span, otel::ATTR_SAVED_INPUT_TOKENS).is_none(),
+        "nothing was stored, so nothing was saved"
+    );
 }

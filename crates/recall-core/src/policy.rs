@@ -13,6 +13,18 @@ pub trait ThresholdPolicy: Send + Sync {
     fn id(&self) -> &str;
     fn decide(&self, ns: &str, top: Option<f32>) -> Verdict;
     fn observe(&self, _ns: &str, _score: f32, _outcome: Outcome) {}
+
+    /// Learned per-namespace bands this policy discarded to make room for another namespace. Read
+    /// at scrape time rather than mirrored into a counter, like the other facts that live below the
+    /// proxy.
+    ///
+    /// Defaults to `0`: a policy that keeps no per-namespace state — `StaticThreshold`, whose
+    /// `observe` is a no-op — has nothing to evict. A rising value means more namespaces are
+    /// sending feedback than the policy will hold at once, so bands are being relearned from the
+    /// cold-start prior instead of accumulating.
+    fn namespaces_evicted(&self) -> u64 {
+        0
+    }
 }
 
 /// A single global cosine cutoff. Correct primitive for the MVP; structurally wrong across a real

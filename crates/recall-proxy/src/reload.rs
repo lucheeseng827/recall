@@ -54,6 +54,10 @@ impl PolicyHandle {
     fn observe(&self, ns: &str, score: f32, outcome: Outcome) {
         self.current.load().observe(ns, score, outcome);
     }
+
+    fn namespaces_evicted(&self) -> u64 {
+        self.current.load().namespaces_evicted()
+    }
 }
 
 /// A `ThresholdPolicy` that delegates every decision to whatever policy its [`PolicyHandle`] currently
@@ -83,6 +87,12 @@ impl ThresholdPolicy for SwappablePolicy {
     }
     fn observe(&self, ns: &str, score: f32, outcome: Outcome) {
         self.handle.observe(ns, score, outcome);
+    }
+
+    // Forwarded, not defaulted: a swappable policy that answered `0` here would report the adaptive
+    // policy underneath it as evicting nothing, precisely in the configuration that can evict.
+    fn namespaces_evicted(&self) -> u64 {
+        self.handle.namespaces_evicted()
     }
 }
 

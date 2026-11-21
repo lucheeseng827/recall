@@ -37,11 +37,21 @@ impl std::fmt::Display for ModelId {
 pub struct Namespace(String);
 
 impl Namespace {
+    /// Longest accepted namespace, in bytes.
+    ///
+    /// A namespace is a structural key, not a payload: the proxy derives one as
+    /// `{base}:{flavor}:{model}:{fingerprint}`, comfortably inside this. The cap exists because a
+    /// namespace is **retained** — as a key in the per-namespace savings ledger and in an adaptive
+    /// policy's learned bands — and both of those bound how many keys they hold. Bounding the count
+    /// while each key may be megabytes long only bounds half the memory, and the sidecar takes its
+    /// namespace verbatim from the request body.
+    pub const MAX_LEN: usize = 512;
+
     pub fn new(s: impl Into<String>) -> Result<Self, RecallError> {
         let s = s.into();
         // Reject the join delimiter and empty strings: `ns_key = format!("{ns}\u{1f}{id}")` is only
         // collision-free if `ns` cannot itself contain `\u{1f}` (PLAN.md §2.3).
-        if s.is_empty() || s.contains('\u{1f}') {
+        if s.is_empty() || s.contains('\u{1f}') || s.len() > Self::MAX_LEN {
             return Err(RecallError::InvalidNamespace);
         }
         Ok(Self(s))
@@ -133,4 +143,27 @@ pub enum Outcome {
 pub enum Lookup {
     Hit { key: Key, score: f32, entry: Entry },
     Miss { vector: Vector },
+}
+
+#[cfg(test)]
+mod namespace_bound_tests {
+    use super::*;
+
+    /// A namespace is retained as a map key in bounded per-namespace state, and on the raw sidecar
+    /// it comes verbatim from the request body. Bounding how many keys those maps hold is only half
+    /// the memory if a single key can be arbitrarily long.
+    #[test]
+    fn a_namespace_longer_than_the_cap_is_not_a_namespace() {
+        let at_cap = "n".repeat(Namespace::MAX_LEN);
+        assert!(
+            Namespace::new(at_cap.clone()).is_ok(),
+            "the cap itself is allowed"
+        );
+        assert!(
+            Namespace::new(format!("{at_cap}n")).is_err(),
+            "one byte over is not"
+        );
+        // The cap is far above anything the proxy derives — `{base}:{flavor}:{model}:{fingerprint}`.
+        assert!(Namespace::new("test:anthropic:claude-sonnet-4-5:0f1e2d3c4b5a6978").is_ok());
+    }
 }

@@ -37,6 +37,12 @@ pub struct Config {
     /// tokens into the `recall_cost_saved_usd_total` metric. Empty by default: recall ships no price
     /// list and makes no network call, so the dollar figure is always the operator's own numbers or
     /// nothing at all (see [`crate::pricing`]). Not hot-reloadable — a rate change needs a restart.
+    /// OTLP/HTTP base for `gen_ai.*` span export (e.g. `http://collector:4318`). `None` — the
+    /// default — means no exporter is built and no span leaves the process, so the network-free
+    /// default stands. See [`crate::otel`].
+    pub otel_endpoint: Option<String>,
+    /// `service.name` on exported spans. Only read when `otel_endpoint` is set.
+    pub otel_service_name: String,
     pub pricing: crate::pricing::PriceBook,
     /// What the store was at start-up: which backend, and how much of a previous run's cache it
     /// recovered. Facts, not knobs — the binary fills them in after opening the store, and
@@ -92,6 +98,10 @@ impl Default for Config {
             anthropic_upstream_base: "https://api.anthropic.com".to_string(),
             anthropic_version: "2023-06-01".to_string(),
             anthropic_api_key: None,
+            // No exporter by default: the network-free default is the product's argument, not a
+            // convenience, so telemetry is opted into rather than out of.
+            otel_endpoint: None,
+            otel_service_name: "recall".to_string(),
             pricing: crate::pricing::PriceBook::default(),
             store: StoreFacts::default(),
         }

@@ -30,6 +30,7 @@ pub mod export;
 pub mod ledger;
 pub mod metrics;
 pub mod namespaces;
+pub mod otel;
 pub mod pricing;
 pub mod reload;
 pub mod replay;
@@ -56,12 +57,53 @@ pub use config::Config;
 use metrics::Metrics;
 pub use reload::{PolicyHandle, SwappablePolicy};
 use request::{
-    anthropic_stream_complete, anthropic_usage, openai_stream_complete, openai_usage, ChatRequest,
-    MessagesRequest, TokenUsage,
+    anthropic_stream_complete, anthropic_usage, openai_stream_complete, openai_usage,
+    response_model, ChatRequest, MessagesRequest, TokenUsage,
 };
+
+/// Start the span flush loop, if span export is configured. Returns immediately when it is not, so
+/// the default build spawns no task and opens no socket.
+///
+/// The loop owns all the waiting. `record` on the hot path only ever pushes into a bounded queue,
+/// and the sink's send is itself fire-and-forget — so a collector that is slow, wedged or gone
+/// cannot reach back into a request. That ordering is the whole design: telemetry must not be able
+/// to hurt the thing it observes.
+pub fn spawn_span_flush(state: Arc<ProxyState>) {
+    let (Some(queue), Some(endpoint)) = (state.otel.clone(), state.config.otel_endpoint.clone())
+    else {
+        return;
+    };
+    let sink = otel::HttpSink::new(state.http.clone(), &endpoint, Vec::new());
+    let service = state.config.otel_service_name.clone();
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(OTEL_FLUSH_INTERVAL_SECS));
+        loop {
+            tick.tick().await;
+            queue.flush(&service, &sink);
+        }
+    });
+    tracing::info!(endpoint, "gen_ai span export enabled");
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, for span timestamps.
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
 
 /// Shared handler state. Held behind an `Arc`; all four cache seams are `Send + Sync + 'static`, so
 /// the cache work can run on a blocking thread without lifetime gymnastics.
+/// How many spans may queue between flushes. Roughly a second of a busy node at the flush interval
+/// below; past it spans are dropped and counted rather than queued, because telemetry must never be
+/// able to OOM the cache it observes (see [`otel::SpanQueue`]).
+pub const OTEL_QUEUE_CAPACITY: usize = 2048;
+
+/// How often the queue is drained and shipped.
+pub const OTEL_FLUSH_INTERVAL_SECS: u64 = 5;
+
 pub struct ProxyState {
     pub cache: Arc<DynCache>,
     pub http: reqwest::Client,
@@ -78,9 +120,120 @@ pub struct ProxyState {
     /// (the default) and the counters therefore reset with this process. Set by the binary after a
     /// successful restore; reported as `recall_ledger_since_time_seconds`.
     pub ledger_since_unix: std::sync::atomic::AtomicU64,
+    /// `gen_ai.*` span export, when an OTLP endpoint is configured. `None` — the default — means
+    /// no queue, no exporter and no span leaving the process. See [`otel`].
+    pub otel: Option<Arc<otel::SpanQueue>>,
+}
+
+/// What an upstream response said about itself: the tokens it billed, and the model that actually
+/// answered. They travel together because both are read off the same body, and both are **absent
+/// rather than guessed** when it did not say. [`UpstreamReport::default`] is the hit case — no
+/// upstream response exists to have said anything.
+#[derive(Default)]
+pub struct UpstreamReport {
+    pub usage: Option<(u64, u64)>,
+    pub model: Option<String>,
+}
+
+/// Read one upstream response's own account of itself.
+///
+/// `usage` is `Some` only where the upstream actually reported it. A response carrying no usage
+/// object parses as `0/0`, and exporting *that* as `gen_ai.usage.*` would read downstream as a call
+/// that cost nothing rather than as one whose cost is unknown — the same distinction
+/// `recall_hits_usage_unknown_total` draws on the metrics side.
+///
+/// Takes the already-parsed `usage` rather than the extractor, because every caller needs the raw
+/// figure for the fill metrics anyway and parsing the body twice to get it would be waste.
+fn upstream_report(text: &str, usage: TokenUsage) -> UpstreamReport {
+    UpstreamReport {
+        usage: (usage.total() > 0).then_some((usage.input, usage.output)),
+        model: response_model(text),
+    }
 }
 
 impl ProxyState {
+    /// Record one cache decision as a `gen_ai.*` span, if export is on. A no-op otherwise, and
+    /// never blocking: the queue is bounded and the send happens on the flush task.
+    ///
+    /// Note what this signature cannot carry. There is no prompt and no completion parameter, so
+    /// the redaction rule the request path already follows — namespace and score only — is enforced
+    /// by the type rather than by remembering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_span(
+        &self,
+        provider: &'static str,
+        model: &str,
+        verdict: otel::Verdict,
+        // `None` where the request never reached the cache at all. A bypass has no key, and an
+        // empty string would be a namespace a consumer could group by (see [`otel::CacheSpan`]).
+        namespace: Option<&str>,
+        score: Option<f64>,
+        report: UpstreamReport,
+        saved: (u64, u64),
+        saved_cost_micros: Option<u64>,
+        started: std::time::Instant,
+    ) {
+        let Some(q) = self.otel.as_ref() else {
+            return;
+        };
+        let end = unix_nanos();
+        let elapsed = started.elapsed().as_nanos();
+        q.record(otel::CacheSpan {
+            gen_ai: Some(otel::GenAi {
+                provider,
+                operation: "chat",
+                model: model.to_string(),
+                response_model: report.model,
+                usage_input_tokens: report.usage.map(|(i, _)| i),
+                usage_output_tokens: report.usage.map(|(_, o)| o),
+            }),
+            verdict,
+            namespace: namespace.map(str::to_string),
+            score,
+            saved_input_tokens: saved.0,
+            saved_output_tokens: saved.1,
+            saved_cost_micros,
+            // Derived by subtraction rather than by reading the clock twice: two `SystemTime` reads
+            // can disagree (it is not monotonic), which yields a negative duration in a collector.
+            start_unix_nanos: end.saturating_sub(elapsed),
+            end_unix_nanos: end,
+        });
+    }
+
+    /// Record one **raw sidecar** lookup (`POST /v1/cache/lookup`) as a span.
+    ///
+    /// Deliberately not [`Self::record_span`]. That caller hands recall a namespace and a prompt
+    /// and nothing else: no model, no vendor, no token count. Dressing the result up as a
+    /// `gen_ai.*` span would file non-LLM traffic into an LLM cost dashboard under a model nobody
+    /// named — so this emits a plain `cache.lookup` span carrying only recall's own vocabulary, and
+    /// the absent [`otel::GenAi`] makes that structural rather than a convention (see
+    /// [`otel::CacheSpan`]).
+    pub fn record_lookup_span(
+        &self,
+        verdict: otel::Verdict,
+        namespace: &str,
+        score: Option<f64>,
+        started: std::time::Instant,
+    ) {
+        let Some(q) = self.otel.as_ref() else {
+            return;
+        };
+        let end = unix_nanos();
+        let elapsed = started.elapsed().as_nanos();
+        q.record(otel::CacheSpan {
+            gen_ai: None,
+            verdict,
+            namespace: Some(namespace.to_string()),
+            score,
+            // The sidecar caller knows what it saved; recall does not.
+            saved_input_tokens: 0,
+            saved_output_tokens: 0,
+            saved_cost_micros: None,
+            start_unix_nanos: end.saturating_sub(elapsed),
+            end_unix_nanos: end,
+        });
+    }
+
     pub fn new(cache: Arc<DynCache>, config: Config) -> Arc<Self> {
         // Bound upstream calls: without timeouts a slow or wedged upstream would pin a proxy worker
         // (and the caller) indefinitely. Both knobs are configurable; fall back to a default client
@@ -94,7 +247,14 @@ impl ProxyState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Built only when an endpoint is configured, so the default build queues nothing and the
+        // hot path's telemetry cost is one `Option` check.
+        let otel = config
+            .otel_endpoint
+            .as_ref()
+            .map(|_| Arc::new(otel::SpanQueue::new(OTEL_QUEUE_CAPACITY)));
         Arc::new(Self {
+            otel,
             started_at_unix,
             cache,
             http,
@@ -205,6 +365,7 @@ async fn chat_completions(
         model: parsed.model().to_string(),
     };
     let upstream = Upstream {
+        provider: "openai",
         base: &state.config.upstream_base,
         path: "/v1/chat/completions",
         auth: Auth::Bearer(state.config.upstream_api_key.as_deref()),
@@ -244,6 +405,7 @@ async fn messages(
         model: parsed.model().to_string(),
     };
     let upstream = Upstream {
+        provider: "anthropic",
         base: &state.config.anthropic_upstream_base,
         path: "/v1/messages",
         auth: Auth::Anthropic {
@@ -284,13 +446,29 @@ async fn serve_cached(
     if let Some(reason) = mapped.bypass {
         Metrics::inc(&state.metrics.bypass);
         tracing::debug!(reason, "bypass");
-        return forward(state, headers, body, upstream, "bypass").await;
+        return forward(
+            state,
+            headers,
+            body,
+            upstream,
+            otel::Verdict::Bypass,
+            &mapped.model,
+        )
+        .await;
     }
     // A non-constructible namespace is a safety stop, not an error: forward without caching.
     let Some(ns) = mapped.namespace else {
         Metrics::inc(&state.metrics.bypass);
         tracing::debug!(reason = "namespace", "bypass");
-        return forward(state, headers, body, upstream, "bypass").await;
+        return forward(
+            state,
+            headers,
+            body,
+            upstream,
+            otel::Verdict::Bypass,
+            &mapped.model,
+        )
+        .await;
     };
     let prompt = mapped.prompt;
     let stream = mapped.stream;
@@ -344,6 +522,22 @@ async fn serve_cached(
             if usage.total() == 0 {
                 Metrics::inc(&state.metrics.hits_usage_unknown);
             }
+            // The span for a served hit. `usage: None` is the load-bearing argument: no model ran,
+            // so there is no `gen_ai.usage.*` to report, and the tokens go to `recall.saved.*`
+            // where nothing sums them as spend (see `otel`).
+            state.record_span(
+                upstream.provider,
+                &mapped.model,
+                otel::Verdict::Hit,
+                Some(ns.as_str()),
+                Some(score as f64),
+                // No upstream response exists, so there is nothing for one to have reported. The
+                // tokens below are what the stored entry means the caller did NOT buy.
+                UpstreamReport::default(),
+                (usage.input, usage.output),
+                priced,
+                lookup_start,
+            );
             // The body was stored under a stream-specific namespace, so a streaming hit always holds
             // SSE (replayed chunk-by-chunk) and a non-streaming hit always holds JSON.
             let mut resp = if stream {
@@ -395,6 +589,7 @@ async fn serve_cached(
                     prompt,
                     vector,
                     mapped.model,
+                    lookup_start,
                 )
                 .await;
             }
@@ -412,36 +607,74 @@ async fn serve_cached(
                     let cacheable = status.is_success()
                         && ct.starts_with("application/json")
                         && serde_json::from_str::<serde_json::Value>(&text).is_ok();
+                    // Read the usage out before `cache_put` takes the body, and whether or not
+                    // this response is cacheable: on a miss an upstream model ran either way, so
+                    // the tokens are the request's own spend and the span reports them either way.
+                    let usage = (upstream.usage_of)(&text);
+                    let report = upstream_report(&text, usage);
                     if cacheable {
                         // Log "stored" only after the write actually succeeds; a failed put must not
                         // claim the entry is cached (the next identical request would miss again).
                         let ns_label = ns.as_str().to_string();
-                        match cache_put(state, ns, prompt, text.clone(), vector).await {
+                        let stored = match cache_put(state, ns, prompt, text.clone(), vector).await
+                        {
                             Ok(()) => {
                                 // The write succeeded, so this entry was bought and kept: credit
                                 // what it cost. Counted here rather than on the miss itself — a
                                 // miss that was not stored bought nothing for the cache, and
                                 // charging it would inflate the fill cost with money that would
                                 // have been spent with recall switched off entirely.
-                                let usage = (upstream.usage_of)(&text);
                                 state.metrics.record_fill(
                                     &state.config.pricing,
                                     &mapped.model,
                                     usage.input,
                                     usage.output,
                                 );
-                                tracing::debug!(namespace = %ns_label, "cache miss (stored)")
+                                tracing::debug!(namespace = %ns_label, "cache miss (stored)");
+                                true
                             }
-                            Err(e) => tracing::warn!(
-                                namespace = %ns_label,
-                                error = %e,
-                                "cache miss store failed"
-                            ),
-                        }
+                            Err(e) => {
+                                tracing::warn!(
+                                    namespace = %ns_label,
+                                    error = %e,
+                                    "cache miss store failed"
+                                );
+                                false
+                            }
+                        };
+                        // The span is allowed to be more truthful than the header. `x-recall-cache`
+                        // is decided before the write is attempted, so a failed put still ships
+                        // `miss` — but nothing was stored, and `miss-nostore` is what happened.
+                        state.record_span(
+                            upstream.provider,
+                            &mapped.model,
+                            if stored {
+                                otel::Verdict::Miss
+                            } else {
+                                otel::Verdict::MissNoStore
+                            },
+                            Some(&ns_label),
+                            None,
+                            report,
+                            (0, 0),
+                            None,
+                            lookup_start,
+                        );
                         text_response(status, "application/json", Some("miss"), text)
                     } else {
                         // Non-2xx / wrong-format upstream → pass through, do not cache.
                         tracing::debug!(status = status.as_u16(), "cache miss (not stored)");
+                        state.record_span(
+                            upstream.provider,
+                            &mapped.model,
+                            otel::Verdict::MissNoStore,
+                            Some(ns.as_str()),
+                            None,
+                            report,
+                            (0, 0),
+                            None,
+                            lookup_start,
+                        );
                         text_response(status, json_ct(&ct), Some("miss-nostore"), text)
                     }
                 }
@@ -477,21 +710,54 @@ async fn cache_lookup(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<LookupReq>,
 ) -> Response {
+    // Counted on the same counters as a proxied request, because this is the same question asked
+    // through a different door. Kept off them, a sidecar-only deployment reported
+    // `recall_hits_total 0` and a hit ratio of zero while it was serving hits — a cache that looks
+    // idle is a cache that gets turned off.
+    Metrics::inc(&state.metrics.requests);
     let ns = match Namespace::new(req.namespace) {
         Ok(ns) => ns,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid namespace"),
     };
-    match cache_get(&state, ns, req.prompt).await {
-        Ok(Lookup::Hit { score, entry, .. }) => json_ok(&LookupResp {
-            hit: true,
-            score: Some(score),
-            completion: Some(entry.completion),
-        }),
-        Ok(Lookup::Miss { .. }) => json_ok(&LookupResp {
-            hit: false,
-            score: None,
-            completion: None,
-        }),
+    let ns_label = ns.as_str().to_string();
+    let lookup_start = std::time::Instant::now();
+    let lookup = cache_get(&state, ns, req.prompt).await;
+    state
+        .metrics
+        .cache_get_seconds
+        .observe(lookup_start.elapsed().as_secs_f64());
+    match lookup {
+        Ok(Lookup::Hit { score, entry, .. }) => {
+            Metrics::inc(&state.metrics.hits);
+            // A sidecar hit really did avoid an upstream call — but the caller never said which
+            // model, so there is no token count and no price. Credited as a hit whose saving is
+            // *unknown* rather than as one that saved nothing, which is the distinction this
+            // counter exists to draw.
+            Metrics::inc(&state.metrics.hits_usage_unknown);
+            // Recorded in the per-namespace ledger with zeroes and unpriced, so `worth it for
+            // whom` still shows the namespace serving hits instead of omitting it entirely.
+            state.namespaces.record_hit(&ns_label, 0, 0, 0, false);
+            state.record_lookup_span(
+                otel::Verdict::Hit,
+                &ns_label,
+                Some(score as f64),
+                lookup_start,
+            );
+            json_ok(&LookupResp {
+                hit: true,
+                score: Some(score),
+                completion: Some(entry.completion),
+            })
+        }
+        Ok(Lookup::Miss { .. }) => {
+            Metrics::inc(&state.metrics.misses);
+            state.record_lookup_span(otel::Verdict::Miss, &ns_label, None, lookup_start);
+            json_ok(&LookupResp {
+                hit: false,
+                score: None,
+                completion: None,
+            })
+        }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
     }
 }
@@ -517,19 +783,43 @@ async fn cache_insert(
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid namespace"),
     };
     let cache = state.cache.clone();
+    let started = std::time::Instant::now();
     let res =
         tokio::task::spawn_blocking(move || cache.put_embedding(&ns, &req.prompt, &req.completion))
             .await;
+    // The same histogram the proxy's writes land in: it is the same work (embed + store) reached
+    // through a different door, and an operator asking "how slow are my writes" wants one answer.
+    state
+        .metrics
+        .cache_put_seconds
+        .observe(started.elapsed().as_secs_f64());
     match res {
-        Ok(Ok(key)) => json_ok(&InsertResp {
-            stored: true,
-            key: key_hex(&key),
-        }),
-        Ok(Err(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+        Ok(Ok(key)) => {
+            // Counted only once the write succeeded, the same rule the fill counters follow — a
+            // failed put stored nothing, and claiming otherwise would overstate what the cache
+            // holds.
+            Metrics::inc(&state.metrics.sidecar_inserts);
+            json_ok(&InsertResp {
+                stored: true,
+                key: key_hex(&key),
+            })
+        }
+        // Both failure shapes land on the same counter: from the operator's side "the write did
+        // not happen" is the fact, and whether it was the store or the worker that failed is what
+        // the log line is for.
+        Ok(Err(e)) => {
+            Metrics::inc(&state.metrics.sidecar_insert_errors);
+            tracing::warn!(error = %e, "sidecar insert failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}"))
+        }
+        Err(e) => {
+            Metrics::inc(&state.metrics.sidecar_insert_errors);
+            tracing::warn!(error = %e, "sidecar insert join failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("join error: {e}"),
+            )
+        }
     }
 }
 
@@ -560,31 +850,35 @@ async fn cache_feedback(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<FeedbackReq>,
 ) -> Response {
+    // Every rejection below is counted, not just returned. A broken client integration — the wrong
+    // outcome word, a score on the wrong scale — otherwise looks exactly like no client at all from
+    // `/metrics`, while the policy trains on nothing (see `Metrics::feedback_rejected`).
+    let reject = |state: &Arc<ProxyState>, msg: &str| -> Response {
+        Metrics::inc(&state.metrics.feedback_rejected);
+        json_error(StatusCode::BAD_REQUEST, msg)
+    };
     let ns = match Namespace::new(req.namespace) {
         Ok(ns) => ns,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid namespace"),
+        Err(_) => return reject(&state, "invalid namespace"),
     };
     let outcome = match req.outcome.as_str() {
         "agree" => Outcome::Agree,
         "wrong" => Outcome::Wrong,
         other => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
+            return reject(
+                &state,
                 &format!("invalid outcome '{other}' (expected: agree | wrong)"),
             )
         }
     };
     if !req.score.is_finite() {
-        return json_error(StatusCode::BAD_REQUEST, "score must be a finite number");
+        return reject(&state, "score must be a finite number");
     }
     // The score is a cosine similarity (a `/v1/cache/lookup` hit score), so it lives in [-1, 1].
     // Reject anything outside that scale before it reaches `observe` — an out-of-range value like
     // 999 would otherwise skew the adaptive policy's per-namespace moments.
     if !(-1.0..=1.0).contains(&req.score) {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "score must be a cosine similarity in [-1, 1]",
-        );
+        return reject(&state, "score must be a cosine similarity in [-1, 1]");
     }
     // Count the judgement at the proxy before handing it to the policy. The default
     // `StaticThreshold` discards observations, so without this a wrong-hit report would vanish
@@ -647,6 +941,7 @@ async fn render_metrics(State(state): State<Arc<ProxyState>>) -> Response {
         store: &state.config.store,
         started_at_unix: state.started_at_unix,
         ambiguity_misses: state.cache.ambiguity_misses(),
+        policy_namespaces_evicted: state.cache.policy_namespaces_evicted(),
         ledger_since_unix: state
             .ledger_since_unix
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -678,7 +973,16 @@ async fn cache_put(
     vector: Vec<f32>,
 ) -> Result<(), RecallError> {
     let cache = state.cache.clone();
-    match tokio::task::spawn_blocking(move || cache.put(&ns, &prompt, &completion, &vector)).await {
+    let started = std::time::Instant::now();
+    let res =
+        tokio::task::spawn_blocking(move || cache.put(&ns, &prompt, &completion, &vector)).await;
+    // Timed regardless of outcome — see `Metrics::cache_put_seconds`. Both proxy write paths
+    // (buffered miss, streamed miss) funnel through here, so one observe covers both.
+    state
+        .metrics
+        .cache_put_seconds
+        .observe(started.elapsed().as_secs_f64());
+    match res {
         Ok(r) => r.map(|_| ()),
         Err(e) => Err(RecallError::Backend(format!("join error: {e}"))),
     }
@@ -690,6 +994,10 @@ async fn cache_put(
 
 /// Where and how to forward a request for a given API flavor.
 struct Upstream<'a> {
+    /// The GenAI provider discriminator for telemetry — `openai` or `anthropic`, the values the
+    /// semantic conventions use. Lives here rather than being re-derived at the emit site so the
+    /// wire flavour and the label it reports can never disagree.
+    provider: &'static str,
     /// Upstream base URL (no trailing `/v1`).
     base: &'a str,
     /// The path appended to `base`, e.g. `/v1/chat/completions` or `/v1/messages`.
@@ -719,18 +1027,42 @@ enum Auth<'a> {
 }
 
 /// Forward and return the upstream response verbatim, tagging it with an `x-recall-cache` label.
+///
+/// The verdict *is* the label — [`otel::Verdict::as_str`] is what goes in the header — so the span
+/// and the header a caller sees cannot drift apart. `model` is passed in because a bypassed request
+/// still has a requested model to report, and this function never parses the body to find one.
 async fn forward(
     state: &Arc<ProxyState>,
     headers: &HeaderMap,
     body: &Bytes,
     upstream: &Upstream<'_>,
-    label: &str,
+    verdict: otel::Verdict,
+    model: &str,
 ) -> Response {
+    // A bypass does no lookup, so this covers exactly the upstream call — which is all of what a
+    // bypassed request spends inside recall.
+    let started = std::time::Instant::now();
     match forward_collect(state, headers, body, upstream).await {
-        Ok((status, ct, text)) => text_response(status, json_ct(&ct), Some(label), text),
+        Ok((status, ct, text)) => {
+            // A model really ran, so these tokens are the request's own spend and belong in
+            // `gen_ai.usage.*`; `recall.saved.*` is zero because the cache saved nothing here. No
+            // namespace and no score: there was no key and no comparison (see `otel::CacheSpan`).
+            state.record_span(
+                upstream.provider,
+                model,
+                verdict,
+                None,
+                None,
+                upstream_report(&text, (upstream.usage_of)(&text)),
+                (0, 0),
+                None,
+                started,
+            );
+            text_response(status, json_ct(&ct), Some(verdict.as_str()), text)
+        }
         Err(msg) => {
             Metrics::inc(&state.metrics.upstream_errors);
-            tracing::warn!(error = %msg, label, "upstream forward failed");
+            tracing::warn!(error = %msg, label = verdict.as_str(), "upstream forward failed");
             json_error(StatusCode::BAD_GATEWAY, &msg)
         }
     }
@@ -829,6 +1161,9 @@ async fn forward_stream_and_cache(
     // The requested model, for pricing the fill. By value because the 'static stream below cannot
     // borrow from `upstream` or the request.
     model: String,
+    // When the cache lookup started, so the span covers lookup + upstream exactly as the buffered
+    // miss does. A streamed span ends when the *stream* does, not when this function returns.
+    lookup_start: std::time::Instant,
 ) -> Response {
     use futures_util::StreamExt;
 
@@ -860,6 +1195,10 @@ async fn forward_stream_and_cache(
     // so the 'static stream owns them (a `fn` pointer is `Copy`).
     let stream_complete = upstream.stream_complete;
     let usage_of = upstream.usage_of;
+    let provider = upstream.provider;
+    // Taken before the match below, because the storing arm moves `ns` into `cache_put` and every
+    // arm — including the ones that store nothing — still has a namespace to report.
+    let ns_label = ns.as_str().to_string();
     let stream = async_stream::stream! {
         let mut acc: Vec<u8> = Vec::new();
         let mut upstream_body = resp.bytes_stream();
@@ -874,11 +1213,29 @@ async fn forward_stream_and_cache(
                 Err(e) => {
                     // Surface the upstream error to the client and stop — nothing is cached.
                     tracing::warn!(error = %e, "upstream stream errored mid-flight; not caching");
+                    // A model did run and bytes did reach the client, but the body never assembled,
+                    // so there is no usage figure to stand behind and nothing was stored.
+                    state.record_span(
+                        provider,
+                        &model,
+                        otel::Verdict::MissNoStore,
+                        Some(ns_label.as_str()),
+                        None,
+                        // The body never assembled, so it never got to say anything about itself.
+                        UpstreamReport::default(),
+                        (0, 0),
+                        None,
+                        lookup_start,
+                    );
                     yield Err(std::io::Error::other(e));
                     return;
                 }
             }
         }
+        // What the span will say, until an arm below proves otherwise: nothing stored, and no
+        // usage figure worth standing behind.
+        let mut verdict = otel::Verdict::MissNoStore;
+        let mut report = UpstreamReport::default();
         // The byte loop ending is NOT proof the completion finished: a graceful upstream half-close
         // looks identical to a clean end here. Store ONLY if the assembled SSE carries its protocol
         // terminator (`[DONE]`/`message_stop`) and no truncation finish/stop reason — otherwise a
@@ -886,10 +1243,12 @@ async fn forward_stream_and_cache(
         if cacheable {
             match String::from_utf8(acc) {
                 Ok(text) if stream_complete(&text) => {
-                    // Log "stored" only after the write succeeds — a failed put isn't a stored entry.
-                    let ns_label = ns.as_str().to_string();
                     // `cache_put` moves `text`, so read the usage out of the assembled SSE first.
-                    let usage = usage_of(&text);
+                    let u = usage_of(&text);
+                    // The completion arrived whole, so its tokens are known even if the write that
+                    // follows fails: the request still bought them.
+                    report = upstream_report(&text, u);
+                    // Log "stored" only after the write succeeds — a failed put isn't a stored entry.
                     match cache_put(&state, ns, prompt, text, vector).await {
                         Ok(()) => {
                             // Same rule as the JSON path: credit the fill only once the write
@@ -897,9 +1256,10 @@ async fn forward_stream_and_cache(
                             state.metrics.record_fill(
                                 &state.config.pricing,
                                 &model,
-                                usage.input,
-                                usage.output,
+                                u.input,
+                                u.output,
                             );
+                            verdict = otel::Verdict::Miss;
                             tracing::debug!(namespace = %ns_label, "streamed miss (stored)")
                         }
                         Err(e) => tracing::warn!(
@@ -914,12 +1274,27 @@ async fn forward_stream_and_cache(
                     // (it precedes the body), so this counter is how the drop is observed.
                     Metrics::inc(&state.metrics.stream_not_stored);
                     tracing::debug!(
-                        namespace = ns.as_str(),
+                        namespace = %ns_label,
                         "streamed miss (not stored — incomplete stream)"
                     );
                 }
             }
         }
+        // Emitted here, at the true end of the stream, rather than where the header was chosen.
+        // `x-recall-cache: miss` precedes the body and can never be corrected, so a stream that
+        // turns out not to be storable ships a `miss` header the span is free to contradict —
+        // this is the only place that knows what actually happened.
+        state.record_span(
+            provider,
+            &model,
+            verdict,
+            Some(ns_label.as_str()),
+            None,
+            report,
+            (0, 0),
+            None,
+            lookup_start,
+        );
     };
 
     let label = if cacheable { "miss" } else { "miss-nostore" };

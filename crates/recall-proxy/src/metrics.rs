@@ -24,6 +24,11 @@ pub struct RuntimeFacts<'a> {
     /// facade owns the gate), so it is read at scrape time like `entries` rather than mirrored into
     /// a counter here. `0` whenever the gate is disarmed, which is the default.
     pub ambiguity_misses: u64,
+    /// Learned per-namespace bands the active threshold policy discarded to make room for another
+    /// namespace. Lives on the policy (below the proxy), so it is read at scrape time like
+    /// `entries` rather than mirrored into a counter here. `0` under the default `--policy static`,
+    /// which keeps no per-namespace state at all.
+    pub policy_namespaces_evicted: u64,
     /// Unix seconds this node's ledger began accumulating, when counter persistence is on
     /// (`--savings-flush-secs`). `0` means the counters reset with this process — the default, and
     /// what every consumer assumed before persistence existed — so the two cases are told apart
@@ -141,6 +146,22 @@ pub struct Metrics {
     /// path-agnostic, and needing no usage parsing, so it stays right even where the provider
     /// reported no token counts.
     pub fill_entries: AtomicU64,
+    /// Entries a **raw-sidecar** caller handed the cache via `POST /v1/cache/insert`, counted when
+    /// the write succeeds. Exposed as `recall_sidecar_inserts_total`.
+    ///
+    /// Deliberately not `fill_entries`, and never touching any fill-cost counter: a fill is an
+    /// entry *this process* bought with an upstream call it made and can price. A sidecar insert
+    /// was bought by the caller, who does not say what it cost — so folding the two together would
+    /// put entries recall never paid for into a figure that claims to be what filling this cache
+    /// cost.
+    pub sidecar_inserts: AtomicU64,
+    /// Sidecar inserts whose write **failed**, so nothing was stored. Exposed as
+    /// `recall_sidecar_insert_errors_total`.
+    ///
+    /// Its own counter rather than an omission from the one above, because a success-only counter
+    /// cannot tell an idle door from a broken one: both leave it flat. The caller gets a `500`, but
+    /// nothing reaches the operator watching `/metrics`.
+    pub sidecar_insert_errors: AtomicU64,
     /// Upstream tokens purchased on requests whose response this process then stored — the exact
     /// mirror of `tokens_saved`, in the other direction. Exposed as `recall_fill_tokens_total`,
     /// with the same input/output split beside it.
@@ -167,6 +188,17 @@ pub struct Metrics {
     /// caught serving a wrong answer. `wrong / (agree + wrong)` is the observed false-hit rate —
     /// the discount an honest savings figure is quoted net of.
     pub feedback_wrong: AtomicU64,
+    /// Feedback posts rejected before they reached the policy — a namespace that is not one, an
+    /// `outcome` that is neither `agree` nor `wrong`, or a score that is not a finite cosine
+    /// similarity in `[-1, 1]`. Exposed as `recall_feedback_rejected_total`.
+    ///
+    /// Its own counter because the two above cannot stand in for it: a client sending `"incorrect"`
+    /// instead of `"wrong"`, or a score on a 0–100 scale, leaves `feedback_agree` and
+    /// `feedback_wrong` flat at zero — identical to no client at all. The observed false-hit rate
+    /// `wrong / (agree + wrong)` is the discount an honest savings figure is quoted net of, so
+    /// "nobody is reporting false hits" and "every report is being thrown away" must not look the
+    /// same from `/metrics`.
+    pub feedback_rejected: AtomicU64,
     /// Streamed misses that were forwarded to the client but NOT stored because the stream did not
     /// terminate cleanly (no `[DONE]`/`message_stop`, a `length`/`max_tokens` truncation, or a
     /// non-UTF-8 body). A streamed reply's `x-recall-cache` header is sent before its body, so such a
@@ -177,6 +209,19 @@ pub struct Metrics {
     /// for every cacheable request (hit or miss) — the p50/p99 the README headlines. Bypassed
     /// requests are excluded (they never looked up). Upstream-forward time on a miss is separate.
     pub cache_get_seconds: Histogram,
+    /// Cache-**write** latency (embed → store), the mirror of `cache_get_seconds` on the other
+    /// side of the cache. Covers every write on every door: a buffered miss being stored, a
+    /// streamed miss stored at the end of its stream, and a raw-sidecar `POST /v1/cache/insert`.
+    ///
+    /// Observed whether the write **succeeded or failed**. A store that takes two seconds and then
+    /// returns an error is exactly what this exists to make visible; timing only the successes
+    /// would hide the slow path that matters most. Pair it with
+    /// `recall_sidecar_insert_errors_total` to tell a slow write from a failing one.
+    ///
+    /// A write is off the request's critical path on the streamed door (it happens after the last
+    /// byte reaches the client) but *on* it for a buffered miss, which is stored before the
+    /// response is returned so a concurrent identical request resolves the fresh entry.
+    pub cache_put_seconds: Histogram,
     /// Upstream forward latency for buffered (non-streamed) requests — a miss or a bypass round-trip.
     /// Streamed upstream calls are intentionally not timed here (their duration is entangled with the
     /// client's read pace, so it is not a clean server-side latency).
@@ -258,10 +303,10 @@ impl Metrics {
     ) {
         match prices.cost_micros(model, input, output) {
             Some(micros) => {
-                // fetch_update rather than fetch_add: a wrapped total would read as a plausible
+                // try_update rather than fetch_add: a wrapped total would read as a plausible
                 // small number, and a money figure that silently resets is worse than one pinned
                 // at the ceiling.
-                let _ = cost_micros.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let _ = cost_micros.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_add(micros))
                 });
             }
@@ -305,6 +350,18 @@ impl Metrics {
         s.push_str(&format!(
             "recall_ambiguity_miss_total {}\n",
             facts.ambiguity_misses
+        ));
+        // Same shape: a counter that lives on the policy, below the proxy, so it is read at scrape
+        // time. A rising value means more namespaces are sending feedback than the policy holds at
+        // once, so bands are being relearned from the cold-start prior rather than accumulating —
+        // the signal to widen the policy's namespace budget or narrow what is feeding it.
+        s.push_str(
+            "# HELP recall_policy_namespaces_evicted_total Learned per-namespace bands the threshold policy discarded to make room for another namespace (0 under --policy static).\n\
+             # TYPE recall_policy_namespaces_evicted_total counter\n",
+        );
+        s.push_str(&format!(
+            "recall_policy_namespaces_evicted_total {}\n",
+            facts.policy_namespaces_evicted
         ));
         // 0 = counters reset with the process (the default). Non-zero = they were restored from a
         // durable ledger that began at this stamp, so they predate `recall_process_start_time_seconds`.
@@ -361,7 +418,10 @@ impl Metrics {
         let huu = self.hits_usage_unknown.load(Ordering::Relaxed);
         let fba = self.feedback_agree.load(Ordering::Relaxed);
         let fbw = self.feedback_wrong.load(Ordering::Relaxed);
+        let fbr = self.feedback_rejected.load(Ordering::Relaxed);
         let fe = self.fill_entries.load(Ordering::Relaxed);
+        let si = self.sidecar_inserts.load(Ordering::Relaxed);
+        let sie = self.sidecar_insert_errors.load(Ordering::Relaxed);
         let ft = self.fill_tokens.load(Ordering::Relaxed);
         let fit = self.fill_input_tokens.load(Ordering::Relaxed);
         let fot = self.fill_output_tokens.load(Ordering::Relaxed);
@@ -389,7 +449,7 @@ impl Metrics {
         counter(
             &mut s,
             "recall_requests_total",
-            "Chat-completion requests received.",
+            "Requests that asked the cache for an answer (proxied completions + raw sidecar lookups).",
             r,
         );
         counter(
@@ -466,6 +526,24 @@ impl Metrics {
         );
         counter(
             &mut s,
+            "recall_feedback_rejected_total",
+            "Feedback posts rejected as malformed, so they never reached the policy.",
+            fbr,
+        );
+        counter(
+            &mut s,
+            "recall_sidecar_inserts_total",
+            "Entries handed to the cache via /v1/cache/insert and successfully written.",
+            si,
+        );
+        counter(
+            &mut s,
+            "recall_sidecar_insert_errors_total",
+            "Sidecar inserts whose write failed, so nothing was stored.",
+            sie,
+        );
+        counter(
+            &mut s,
             "recall_fill_tokens_total",
             "Upstream tokens purchased on responses this process then stored.",
             ft,
@@ -504,6 +582,11 @@ impl Metrics {
             &mut s,
             "recall_cache_get_duration_seconds",
             "End-to-end cache lookup latency (embed + ANN search + decide) for cacheable requests.",
+        );
+        self.cache_put_seconds.render(
+            &mut s,
+            "recall_cache_put_duration_seconds",
+            "Cache write latency (embed + store), across the proxy and sidecar doors, whether the write succeeded or failed.",
         );
         self.upstream_seconds.render(
             &mut s,

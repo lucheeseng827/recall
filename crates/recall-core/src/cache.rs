@@ -280,6 +280,12 @@ where
     pub fn policy_id(&self) -> &str {
         self.policy.id()
     }
+
+    /// Learned bands the active policy discarded to make room. See
+    /// [`ThresholdPolicy::namespaces_evicted`].
+    pub fn policy_namespaces_evicted(&self) -> u64 {
+        self.policy.namespaces_evicted()
+    }
 }
 
 /// Unix-epoch SECONDS. Stored on `Entry` so TTL math survives a restart (an `Instant` would not).

@@ -114,7 +114,36 @@ $ curl -s -X POST http://127.0.0.1:8080/v1/cache/feedback -H "content-type: appl
 
 The `policy` field shows whether feedback actually trains: a `static@…` policy
 accepts feedback but ignores it; only `adaptive@…` learns. Errors: `400` invalid
-namespace / outcome / out-of-range score.
+namespace (empty, containing `U+001F`, or longer than 512 bytes) / outcome /
+out-of-range score.
+
+**Every rejection is counted** on `recall_feedback_rejected_total`. A client
+sending `"incorrect"` instead of `"wrong"`, or a score on a 0–100 scale, leaves
+`recall_feedback_agree_total` and `recall_feedback_wrong_total` flat at zero —
+indistinguishable from no client at all — while the policy trains on nothing.
+Watch that counter when wiring a feedback source for the first time.
+
+An adaptive policy holds learned state for at most **512 namespaces**, behind a
+doorkeeper queue of at most **4096** it has merely heard from — a queue entry is
+two integers and a key, not a band. A namespace earns a band on its **second**
+observation, so a flood of distinct namespaces allocates no band and displaces
+none, however long it runs. The queue is eight times the band budget so that a
+namespace posting feedback slowly still has its first observation remembered
+when its second arrives; a flood longer than the queue ages out a single knock,
+never a band.
+
+Taking a band from a full budget requires knocking at least as many times as the
+band being displaced has been observed, and the displaced namespace returns to
+the queue carrying what it earned. Band eviction is least-recently-used, counting
+**lookups as well as feedback**, so a namespace serving live traffic with no
+feedback source attached keeps its band.
+
+Bands are never merged into a shared band: the learned τ *is* the cutoff a
+future lookup is measured against, so pooling distinct namespaces' score
+distributions would let traffic that is not a namespace's own move the threshold
+its hits are served at. Displacements are counted on
+`recall_policy_namespaces_evicted_total`; queue churn is not, because a namespace
+at the door has no learned state to lose.
 
 ### `GET /v1/cache/namespaces` — savings, split by namespace
 
@@ -157,19 +186,22 @@ as `by_namespace`.
 
 | metric | type | meaning |
 |---|---|---|
-| `recall_requests_total` | counter | Proxy-flavor requests received (`/v1/chat/completions` + `/v1/messages`). |
-| `recall_hits_total` / `recall_misses_total` / `recall_bypass_total` | counter | Disposition counts. A **miss** is counted at lookup time for every cacheable request the cache could not answer — including ones whose upstream forward then failed or returned a non-cacheable body — so `hits / (hits + misses)` is a rate over cacheable traffic, not over stored entries. |
+| `recall_requests_total` | counter | Requests that asked the cache for an answer: the proxy flavors (`/v1/chat/completions` + `/v1/messages`) **and** raw sidecar lookups (`/v1/cache/lookup`). `/v1/cache/insert` and `/v1/cache/feedback` are excluded — they ask the cache nothing. |
+| `recall_hits_total` / `recall_misses_total` / `recall_bypass_total` | counter | Disposition counts, across **both** front doors — a raw sidecar lookup is the same question asked a different way, and counts the same. A **miss** is counted at lookup time for every cacheable request the cache could not answer — including ones whose upstream forward then failed or returned a non-cacheable body — so `hits / (hits + misses)` is a rate over cacheable traffic, not over stored entries. `recall_bypass_total` is proxy-only: the sidecar has nothing to bypass. |
 | `recall_upstream_errors_total` | counter | Upstream forwarding failures (the 502s). |
 | `recall_tokens_saved_total` | counter | Upstream tokens **not purchased** because a hit answered (from the stored body's `usage`). |
 | `recall_input_tokens_saved_total` / `recall_output_tokens_saved_total` | counter | The saved tokens split by price tier (output costs 3–5× input; price them separately). |
 | `recall_cost_saved_usd_total` | counter | Upstream spend avoided, priced with **your** `[pricing.<model>]` rates ([CONFIG](./CONFIG.md#pricingmodel--report-savings-in-dollars)). `0` when no rates are configured — recall ships no price list and makes no network call. |
 | `recall_unpriced_tokens_saved_total` | counter | Tokens saved for models with **no** configured rule. They contribute `$0` above and are flagged here instead, so an incomplete price table reads as *unpriced* rather than as *no savings*. |
-| `recall_hits_usage_unknown_total` | counter | Hits whose stored completion reported no token usage at all (e.g. an OpenAI stream cached without `stream_options.include_usage`). They credit nothing to the counters above, so a non-zero value means the savings are an **under-count**, not an idle cache. |
+| `recall_hits_usage_unknown_total` | counter | Hits that credited nothing to the savings counters above, so a non-zero value means the savings are an **under-count**, not an idle cache. Two causes: a stored completion that reported no token usage (an OpenAI stream cached without `stream_options.include_usage`, say), and **every raw sidecar hit** — that caller never names a model or a token count, so the saving is real and unmeasurable rather than zero. |
 | `recall_feedback_agree_total` / `recall_feedback_wrong_total` | counter | Served hits reported correct / wrong via `/v1/cache/feedback`. `wrong / (agree + wrong)` is the **observed** false-hit rate. Counted at the proxy, so they record the judgement even under `--policy static`, which accepts feedback without learning from it. |
+| `recall_feedback_rejected_total` | counter | Feedback posts rejected as malformed — bad namespace, an `outcome` that is neither `agree` nor `wrong`, a score that is not a finite cosine similarity in [-1, 1]. Its own counter because a rejected report leaves the two above **flat at zero**, which is exactly what no client at all looks like; without it a broken integration and a silent one are the same picture. |
+| `recall_policy_namespaces_evicted_total` | counter | Learned per-namespace bands the threshold policy discarded to make room for another namespace (it holds at most 512). `0` under the default `--policy static`, which keeps no such state. Read at scrape time from the policy, like `recall_cache_entries`. A rising value means more namespaces are sending feedback than the policy holds at once, so bands are being relearned from the cold-start prior rather than accumulating. |
 | `recall_cache_entries` | gauge | Completions the store currently holds, read live at scrape time (cheap on both backends — a map length or a B-tree metadata read). Correct across a restart that rehydrated a durable store. |
 | `recall_ambiguity_miss_total` | counter | Would-be hits demoted to misses by the second-neighbour ambiguity gate (`--ambiguity-eps`). `0` while the gate is disarmed, which is the default. Read against `recall_hits_total` to see what the gate costs in hit-rate for the false hits it prevents. |
 | `recall_ledger_since_time_seconds` | gauge | Unix time the node's **persisted** savings ledger began (`--savings-flush-secs`). `0` — the default — means the counters reset with this process, i.e. `recall_process_start_time_seconds` is the boundary. Non-zero means they predate it. |
-| `recall_fill_entries_total` | counter | Entries this process bought from the upstream and stored. Credited when the write **succeeds** — a miss that was not stored bought nothing for the cache. |
+| `recall_fill_entries_total` | counter | Entries this process bought from the upstream and stored. Credited when the write **succeeds** — a miss that was not stored bought nothing for the cache. Proxy-only: a sidecar insert was bought by the caller, not by recall, and is counted separately. |
+| `recall_sidecar_inserts_total` / `recall_sidecar_insert_errors_total` | counter | Entries handed to the cache via `POST /v1/cache/insert` and successfully written / whose write failed. Kept off the fill counters because a fill is an entry recall bought with an upstream call it made and can price, and these the caller paid for and never priced. The error counter is its own line because a success-only counter cannot tell an idle door from a broken one — both leave it flat, while the caller's `500` never reaches whoever is watching `/metrics`. |
 | `recall_fill_tokens_total` | counter | Upstream tokens purchased on responses this process then stored, with `recall_fill_input_tokens_total` / `recall_fill_output_tokens_total` beside it. The mirror of the saved counters, in the other direction. |
 | `recall_fill_cost_usd_total` | counter | What filling this cache cost, priced from the same `[pricing.<model>]` table as the savings — so `saved / fill` is this instance's payback. |
 | `recall_unpriced_fill_tokens_total` / `recall_fill_usage_unknown_total` | counter | The two ways the fill cost can under-count: a model with no price rule, and a response that reported no usage. |
@@ -178,6 +210,7 @@ as `by_namespace`.
 | `recall_store_info{backend,durable}` | gauge | Constant 1; the labels carry the store backend and whether it survives a restart. Disambiguates `recall_rehydrated_entries 0` between "nothing to rebuild" and "recovered nothing". |
 | `recall_stream_not_stored_total` | counter | Streamed misses forwarded but not cached (dirty stream end — no `[DONE]`/`message_stop`, truncation, non-UTF-8). |
 | `recall_cache_get_duration_seconds` | histogram | End-to-end lookup latency (exact-hash → embed → ANN → decide) for cacheable requests. |
+| `recall_cache_put_duration_seconds` | histogram | Cache **write** latency (embed + store) — the mirror of the lookup histogram on the other side of the cache. Covers every write on every door: a buffered miss stored before its response returns (so this latency is on the caller's critical path), a streamed miss stored after its last byte (so it is not), and `POST /v1/cache/insert`. Observed whether the write **succeeded or failed** — a store that takes two seconds and *then* errors is exactly what this is for, and timing only successes would hide it. Read it against `recall_sidecar_insert_errors_total` to tell a slow write from a failing one. |
 | `recall_upstream_duration_seconds` | histogram | Upstream forward latency for buffered (non-streamed) calls. |
 | `recall_hit_ratio` | gauge | `hits / (hits + misses)` — over cacheable traffic only (bypasses excluded). |
 
